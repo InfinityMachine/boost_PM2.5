@@ -179,6 +179,15 @@ def parse_args() -> argparse.Namespace:
         help="区域层级先验的平滑强度，默认：15.0",
     )
     parser.add_argument(
+        "--region-prior-smoothing-values",
+        default="",
+        help=(
+            "需要批量比较的区域层级先验平滑强度，逗号分隔。"
+            "可写数值，也可写 off/none 表示关闭区域先验。"
+            "例如：5,10,15,20,off。默认：空（只使用 --region-prior-smoothing）"
+        ),
+    )
+    parser.add_argument(
         "--no-region-priors",
         action="store_true",
         help="关闭区域层级先验特征",
@@ -275,6 +284,63 @@ def parse_path_candidates(raw_text: str) -> list[str]:
     return candidates
 
 
+def parse_region_prior_setting_candidates(
+    raw_text: str,
+    default_smoothing: float,
+    no_region_priors: bool,
+) -> list[dict[str, Any]]:
+    """
+    解析区域层级先验的对比设置。
+
+    支持两种使用方式：
+    1. 不传 `--region-prior-smoothing-values`，则只跑当前单一设置；
+    2. 传入多个值时，脚本会在同一次运行中逐个比较。
+    """
+    if not raw_text.strip():
+        if no_region_priors:
+            return [
+                {
+                    "enabled": False,
+                    "smoothing": None,
+                    "label": "off",
+                }
+            ]
+        return [
+            {
+                "enabled": True,
+                "smoothing": float(default_smoothing),
+                "label": f"s{default_smoothing:g}",
+            }
+        ]
+
+    candidates: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    for item in [part.strip() for part in raw_text.split(",") if part.strip()]:
+        item_lower = item.lower()
+        if item_lower in {"off", "none", "disable", "disabled"}:
+            label = "off"
+            candidate = {"enabled": False, "smoothing": None, "label": label}
+        else:
+            try:
+                smoothing = float(item)
+            except ValueError as exc:
+                raise ValueError(
+                    f"无法解析 region-prior-smoothing-values 中的值：{item}"
+                ) from exc
+            if smoothing <= 0.0:
+                raise ValueError("区域层级先验平滑强度必须大于 0。")
+            label = f"s{smoothing:g}"
+            candidate = {"enabled": True, "smoothing": smoothing, "label": label}
+
+        if label not in seen_labels:
+            candidates.append(candidate)
+            seen_labels.add(label)
+
+    if not candidates:
+        raise ValueError("region-prior-smoothing-values 不能为空。")
+    return candidates
+
+
 def build_result_row(
     path_name: str,
     path_type: str,
@@ -284,6 +350,9 @@ def build_result_row(
     y_test: pd.Series,
     final_test_pred,
     high_pm25_threshold: float,
+    region_prior_enabled: bool,
+    region_prior_smoothing: float | None,
+    region_prior_label: str,
 ) -> dict[str, Any]:
     metrics = calculate_metrics(y_test, final_test_pred)
     high_metrics, high_count = calculate_high_pm25_metrics(
@@ -301,6 +370,9 @@ def build_result_row(
         "weight_strategy": ensemble_config.get("strategy", ""),
         "objective_metric": ensemble_config.get("objective_metric", ""),
         "objective_score": ensemble_config.get("objective_score"),
+        "region_prior_enabled": bool(region_prior_enabled),
+        "region_prior_smoothing": region_prior_smoothing,
+        "region_prior_label": region_prior_label,
         "test_rmse": float(metrics["RMSE"]),
         "test_mae": float(metrics["MAE"]),
         "test_r2": float(metrics["R2"]),
@@ -313,11 +385,29 @@ def build_result_row(
 
 def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> None:
     """绘制各建模路径在整体 RMSE 与高污染子集 RMSE 上的对比图。"""
-    plot_df = results_df.sort_values(
-        ["test_rmse", "high_pm25_rmse", "path_name"]
-    ).reset_index(drop=True)
+    has_multiple_region_settings = (
+        "region_prior_label" in results_df.columns
+        and results_df["region_prior_label"].nunique() > 1
+    )
+    if has_multiple_region_settings:
+        plot_df = results_df.assign(
+            region_prior_smoothing_sort=results_df["region_prior_smoothing"].fillna(-1.0)
+        ).sort_values(
+            ["path_name", "region_prior_enabled", "region_prior_smoothing_sort"]
+        ).reset_index(drop=True)
+        labels = [
+            f"{path_name}\n[{region_label}]"
+            for path_name, region_label in zip(
+                plot_df["path_name"], plot_df["region_prior_label"]
+            )
+        ]
+    else:
+        plot_df = results_df.sort_values(
+            ["test_rmse", "high_pm25_rmse", "path_name"]
+        ).reset_index(drop=True)
+        labels = plot_df["path_name"].tolist()
+
     x_positions = list(range(len(plot_df)))
-    labels = plot_df["path_name"].tolist()
     test_rmse = plot_df["test_rmse"].tolist()
     high_rmse = plot_df["high_pm25_rmse"].tolist()
 
@@ -338,7 +428,11 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
         color="#FF7A45",
         label="High-PM2.5 RMSE",
     )
-    axes[0].set_title("RMSE by Modeling Path")
+    axes[0].set_title(
+        "RMSE by Modeling Path"
+        if not has_multiple_region_settings
+        else "RMSE by Modeling Path and Region Prior Setting"
+    )
     axes[0].set_ylabel("RMSE")
     axes[0].set_xticks(x_positions)
     axes[0].set_xticklabels(labels, rotation=25, ha="right")
@@ -349,7 +443,11 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
     gap_colors = ["#5B8C00" if gap <= 0 else "#BFBFBF" for gap in rmse_gap]
     axes[1].bar(x_positions, rmse_gap, color=gap_colors)
     axes[1].axhline(0.0, color="#595959", linewidth=1.0)
-    axes[1].set_title("High-PM2.5 vs Overall RMSE Gap")
+    axes[1].set_title(
+        "High-PM2.5 vs Overall RMSE Gap"
+        if not has_multiple_region_settings
+        else "RMSE Gap by Region Prior Setting"
+    )
     axes[1].set_ylabel("High-PM2.5 RMSE - Overall RMSE")
     axes[1].set_xticks(x_positions)
     axes[1].set_xticklabels(labels, rotation=25, ha="right")
@@ -488,104 +586,29 @@ def train_xgb_path(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    run_name = build_default_run_name("compare_rmse_paths", args.run_name)
-    out_path = resolve_output_path(args.out, run_name)
-    plot_path = resolve_plot_path(args.plot_out, run_name)
-    path_candidates = parse_path_candidates(args.paths)
-
-    x, y = load_data(Path(args.data), args.target)
-    if not args.keep_id_cols:
-        x, dropped_cols = remove_identifier_columns(x)
-        if dropped_cols:
-            print(f"[信息] 已自动剔除疑似 ID 列：{dropped_cols}")
-
-    if args.no_log_features:
-        print("[信息] 已关闭 log1p 特征扩展。")
-    else:
-        x, added_log_cols, skipped_log_cols = add_log_transformed_features(
-            x=x,
-            candidate_cols=parse_feature_list(args.log_feature_cols),
-        )
-        if added_log_cols:
-            print(f"[信息] 已新增 log1p 特征：{added_log_cols}")
-        if skipped_log_cols:
-            print(f"[信息] 跳过的 log1p 特征：{skipped_log_cols}")
-
-    groups = None
-    groups_train = None
-    groups_test = None
-    if args.validation_mode == "group":
-        groups = resolve_groups(x, args.group_col)
-        x_train, x_test, y_train, y_test, groups_train, groups_test = (
-            split_train_test_by_group(
-                x=x,
-                y=y,
-                groups=groups,
-                test_size=args.test_size,
-                random_state=args.random_state,
-            )
-        )
-    else:
-        x_train, x_test, y_train, y_test = split_train_test_random(
-            x=x,
-            y=y,
-            test_size=args.test_size,
-            random_state=args.random_state,
-        )
-
-    print(f"[信息] 当前运行目录：{run_name}")
-    print(f"[信息] 当前训练设备：{args.device.upper()}")
-    print(f"[信息] 当前验证方式：{args.validation_mode}")
-    print(f"[信息] 当前比较路径：{path_candidates}")
-
-    sample_weight_config = build_sample_weight_config(
-        y_train=y_train,
-        mode=args.sample_weight_mode,
-        quantile=args.high_pm25_quantile,
-        high_weight=args.high_pm25_weight,
-    )
-    high_pm25_eval_config = build_high_pm25_eval_config(
-        y_train=y_train,
-        quantile=args.eval_high_pm25_quantile,
-    )
-    trend_sample_weight = compute_sample_weights(y_train, sample_weight_config)
-    residual_sample_weight = compute_sample_weights(y_train, sample_weight_config)
-    print(
-        f"[信息] 当前样本加权：{describe_sample_weighting(sample_weight_config, y_train)}"
-    )
-    print(
-        "[信息] 高污染子集评估阈值："
-        f"quantile={high_pm25_eval_config['quantile']:.2f}, "
-        f"threshold={high_pm25_eval_config['threshold']:.4f}"
-    )
-
-    print(f"[信息] 开始生成线性趋势 OOF 预测：trend_cv_folds={args.trend_cv_folds}")
-    trend_train_oof_pred = generate_oof_trend_predictions(
-        x_train=x_train,
-        y_train=y_train,
-        groups_train=groups_train,
-        cv_folds=args.trend_cv_folds,
-        random_state=args.random_state,
-        validation_mode=args.validation_mode,
-        trend_model=args.trend_model,
-        weight_config=sample_weight_config,
-    )
-    trend_model = fit_final_trend_model(
-        x_train=x_train,
-        y_train=y_train,
-        trend_model=args.trend_model,
-        sample_weight=trend_sample_weight,
-    )
-    trend_test_pred = trend_model.predict(x_test)
-    residual_train_oof = y_train - trend_train_oof_pred
+def evaluate_paths_for_region_prior_setting(
+    args: argparse.Namespace,
+    path_candidates: list[str],
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    groups_train,
+    trend_train_oof_pred: np.ndarray,
+    trend_test_pred: np.ndarray,
+    residual_train_oof: pd.Series,
+    residual_sample_weight,
+    high_pm25_eval_config: dict[str, float],
+    region_prior_setting: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """在给定区域先验配置下，训练并评估多条建模路径。"""
+    region_prior_label = str(region_prior_setting["label"])
     x_train_aug_for_tune = make_augmented_features(x_train, trend_train_oof_pred)
     x_train_aug_for_fit = x_train_aug_for_tune.copy()
     x_test_aug = make_augmented_features(x_test, trend_test_pred)
 
-    if args.no_region_priors:
-        print("[信息] 已关闭区域层级先验特征。")
+    if not region_prior_setting["enabled"]:
+        print(f"[信息] 区域层级先验设置：{region_prior_label}（关闭）")
     else:
         region_prior_cols = parse_feature_list(
             args.region_prior_cols,
@@ -602,7 +625,7 @@ def main() -> None:
                 random_state=args.random_state,
                 validation_mode=args.validation_mode,
                 region_cols=region_prior_cols,
-                smoothing=args.region_prior_smoothing,
+                smoothing=float(region_prior_setting["smoothing"]),
             )
         )
         if region_prior_config["enabled"]:
@@ -619,16 +642,18 @@ def main() -> None:
                 region_test_prior_df,
             )
             print(
-                "[信息] 已启用区域层级先验特征："
-                f"cols={region_prior_config['region_cols']}, "
+                "[信息] 区域层级先验设置："
+                f"{region_prior_label} -> cols={region_prior_config['region_cols']}, "
                 f"smoothing={region_prior_config['smoothing']:.2f}, "
                 f"features={len(region_prior_config['feature_names'])}"
             )
         else:
-            print("[信息] 未生成区域层级先验特征：未找到可用地区列。")
+            print(
+                "[信息] 区域层级先验设置："
+                f"{region_prior_label} -> 未生成特征（未找到可用地区列）"
+            )
 
     path_results: list[dict[str, Any]] = []
-
     xgb_bundles: dict[str, dict[str, Any]] = {}
     need_xgb_all = any("xgb_all" in path or path.endswith("_all") for path in path_candidates)
     need_xgb_comp = any("complementary" in path for path in path_candidates)
@@ -770,6 +795,9 @@ def main() -> None:
                     y_test=y_test,
                     final_test_pred=final_pred,
                     high_pm25_threshold=high_pm25_eval_config["threshold"],
+                    region_prior_enabled=bool(region_prior_setting["enabled"]),
+                    region_prior_smoothing=region_prior_setting["smoothing"],
+                    region_prior_label=region_prior_label,
                 )
             )
         elif path_name == "xgb_complementary":
@@ -789,6 +817,9 @@ def main() -> None:
                     y_test=y_test,
                     final_test_pred=final_pred,
                     high_pm25_threshold=high_pm25_eval_config["threshold"],
+                    region_prior_enabled=bool(region_prior_setting["enabled"]),
+                    region_prior_smoothing=region_prior_setting["smoothing"],
+                    region_prior_label=region_prior_label,
                 )
             )
         elif path_name == "catboost":
@@ -809,6 +840,9 @@ def main() -> None:
                     y_test=y_test,
                     final_test_pred=final_pred,
                     high_pm25_threshold=high_pm25_eval_config["threshold"],
+                    region_prior_enabled=bool(region_prior_setting["enabled"]),
+                    region_prior_smoothing=region_prior_setting["smoothing"],
+                    region_prior_label=region_prior_label,
                 )
             )
         elif path_name.startswith("ensemble_"):
@@ -821,11 +855,7 @@ def main() -> None:
                 bundle = xgb_bundles["complementary"]
                 xgb_view = "complementary"
 
-            if "overall" in path_name:
-                objective = "overall"
-            else:
-                objective = "blended"
-
+            objective = "overall" if "overall" in path_name else "blended"
             ensemble_config = resolve_ensemble_weights(
                 residual_model="ensemble",
                 manual_weight_xgb=None,
@@ -854,10 +884,138 @@ def main() -> None:
                     y_test=y_test,
                     final_test_pred=final_pred,
                     high_pm25_threshold=high_pm25_eval_config["threshold"],
+                    region_prior_enabled=bool(region_prior_setting["enabled"]),
+                    region_prior_smoothing=region_prior_setting["smoothing"],
+                    region_prior_label=region_prior_label,
                 )
             )
         else:
             raise ValueError(f"不支持的路径名称：{path_name}")
+
+    return path_results
+
+
+def main() -> None:
+    args = parse_args()
+    run_name = build_default_run_name("compare_rmse_paths", args.run_name)
+    out_path = resolve_output_path(args.out, run_name)
+    plot_path = resolve_plot_path(args.plot_out, run_name)
+    path_candidates = parse_path_candidates(args.paths)
+    region_prior_settings = parse_region_prior_setting_candidates(
+        raw_text=args.region_prior_smoothing_values,
+        default_smoothing=args.region_prior_smoothing,
+        no_region_priors=args.no_region_priors,
+    )
+
+    x, y = load_data(Path(args.data), args.target)
+    if not args.keep_id_cols:
+        x, dropped_cols = remove_identifier_columns(x)
+        if dropped_cols:
+            print(f"[信息] 已自动剔除疑似 ID 列：{dropped_cols}")
+
+    if args.no_log_features:
+        print("[信息] 已关闭 log1p 特征扩展。")
+    else:
+        x, added_log_cols, skipped_log_cols = add_log_transformed_features(
+            x=x,
+            candidate_cols=parse_feature_list(args.log_feature_cols),
+        )
+        if added_log_cols:
+            print(f"[信息] 已新增 log1p 特征：{added_log_cols}")
+        if skipped_log_cols:
+            print(f"[信息] 跳过的 log1p 特征：{skipped_log_cols}")
+
+    groups = None
+    groups_train = None
+    groups_test = None
+    if args.validation_mode == "group":
+        groups = resolve_groups(x, args.group_col)
+        x_train, x_test, y_train, y_test, groups_train, groups_test = (
+            split_train_test_by_group(
+                x=x,
+                y=y,
+                groups=groups,
+                test_size=args.test_size,
+                random_state=args.random_state,
+            )
+        )
+    else:
+        x_train, x_test, y_train, y_test = split_train_test_random(
+            x=x,
+            y=y,
+            test_size=args.test_size,
+            random_state=args.random_state,
+        )
+
+    print(f"[信息] 当前运行目录：{run_name}")
+    print(f"[信息] 当前训练设备：{args.device.upper()}")
+    print(f"[信息] 当前验证方式：{args.validation_mode}")
+    print(f"[信息] 当前比较路径：{path_candidates}")
+    print(
+        "[信息] 当前区域层级先验设置："
+        f"{[setting['label'] for setting in region_prior_settings]}"
+    )
+
+    sample_weight_config = build_sample_weight_config(
+        y_train=y_train,
+        mode=args.sample_weight_mode,
+        quantile=args.high_pm25_quantile,
+        high_weight=args.high_pm25_weight,
+    )
+    high_pm25_eval_config = build_high_pm25_eval_config(
+        y_train=y_train,
+        quantile=args.eval_high_pm25_quantile,
+    )
+    trend_sample_weight = compute_sample_weights(y_train, sample_weight_config)
+    residual_sample_weight = compute_sample_weights(y_train, sample_weight_config)
+    print(
+        f"[信息] 当前样本加权：{describe_sample_weighting(sample_weight_config, y_train)}"
+    )
+    print(
+        "[信息] 高污染子集评估阈值："
+        f"quantile={high_pm25_eval_config['quantile']:.2f}, "
+        f"threshold={high_pm25_eval_config['threshold']:.4f}"
+    )
+
+    print(f"[信息] 开始生成线性趋势 OOF 预测：trend_cv_folds={args.trend_cv_folds}")
+    trend_train_oof_pred = generate_oof_trend_predictions(
+        x_train=x_train,
+        y_train=y_train,
+        groups_train=groups_train,
+        cv_folds=args.trend_cv_folds,
+        random_state=args.random_state,
+        validation_mode=args.validation_mode,
+        trend_model=args.trend_model,
+        weight_config=sample_weight_config,
+    )
+    trend_model = fit_final_trend_model(
+        x_train=x_train,
+        y_train=y_train,
+        trend_model=args.trend_model,
+        sample_weight=trend_sample_weight,
+    )
+    trend_test_pred = trend_model.predict(x_test)
+    residual_train_oof = y_train - trend_train_oof_pred
+    path_results: list[dict[str, Any]] = []
+    for region_setting in region_prior_settings:
+        print("\n" + "=" * 72)
+        path_results.extend(
+            evaluate_paths_for_region_prior_setting(
+                args=args,
+                path_candidates=path_candidates,
+                x_train=x_train,
+                x_test=x_test,
+                y_train=y_train,
+                y_test=y_test,
+                groups_train=groups_train,
+                trend_train_oof_pred=trend_train_oof_pred,
+                trend_test_pred=trend_test_pred,
+                residual_train_oof=residual_train_oof,
+                residual_sample_weight=residual_sample_weight,
+                high_pm25_eval_config=high_pm25_eval_config,
+                region_prior_setting=region_setting,
+            )
+        )
 
     results_df = pd.DataFrame(path_results)
     results_df["test_rmse_rank"] = results_df["test_rmse"].rank(method="min")
@@ -865,9 +1023,30 @@ def main() -> None:
     results_df["combined_rank_sum"] = (
         results_df["test_rmse_rank"] + results_df["high_pm25_rmse_rank"]
     )
-    results_df = results_df.sort_values(
-        ["test_rmse", "high_pm25_rmse", "path_name"]
-    ).reset_index(drop=True)
+    results_df["test_rmse_rank_within_path"] = results_df.groupby("path_name")[
+        "test_rmse"
+    ].rank(method="min")
+    results_df["high_pm25_rmse_rank_within_path"] = results_df.groupby("path_name")[
+        "high_pm25_rmse"
+    ].rank(method="min")
+
+    has_multiple_region_settings = results_df["region_prior_label"].nunique() > 1
+    if has_multiple_region_settings:
+        results_df = results_df.assign(
+            region_prior_smoothing_sort=results_df["region_prior_smoothing"].fillna(-1.0)
+        ).sort_values(
+            [
+                "path_name",
+                "test_rmse",
+                "high_pm25_rmse",
+                "region_prior_enabled",
+                "region_prior_smoothing_sort",
+            ]
+        ).drop(columns=["region_prior_smoothing_sort"]).reset_index(drop=True)
+    else:
+        results_df = results_df.sort_values(
+            ["test_rmse", "high_pm25_rmse", "path_name"]
+        ).reset_index(drop=True)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(out_path, index=False, encoding="utf-8-sig")
@@ -877,6 +1056,8 @@ def main() -> None:
     print("\n=== 路径对比结果（按 test_rmse 排序） ===")
     display_cols = [
         "path_name",
+        "region_prior_label",
+        "region_prior_smoothing",
         "path_type",
         "xgb_view",
         "objective",
@@ -884,6 +1065,7 @@ def main() -> None:
         "catboost_weight",
         "test_rmse",
         "high_pm25_rmse",
+        "test_rmse_rank_within_path",
         "test_mae",
         "high_pm25_mae",
         "test_r2",
