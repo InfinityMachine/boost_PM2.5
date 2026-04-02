@@ -16,6 +16,7 @@ from typing import Any
 # 依赖检查：如果缺少必要包，直接给出安装提示并停止运行。
 try:
     import joblib
+    import matplotlib
     import numpy as np
     import pandas as pd
     from sklearn.compose import ColumnTransformer
@@ -33,6 +34,9 @@ except ImportError as exc:
         "请先安装后再运行，例如：\n"
         "pip install joblib scikit-learn xgboost pandas numpy"
     ) from exc
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,10 +68,16 @@ def parse_args() -> argparse.Namespace:
         help="模型输出文件路径，默认：pm25_xgboost_pipeline.joblib",
     )
     parser.add_argument(
+        "--plot-out",
+        default="pm25_xgboost_diagnostics.png",
+        help="诊断图输出路径，默认：pm25_xgboost_diagnostics.png",
+    )
+    parser.add_argument(
         "--keep-id-cols",
         action="store_true",
         help="保留疑似 ID 列（默认会自动剔除，如 OBJECTID_1）",
     )
+    parser.add_argument("--no-plot", action="store_true", help="不绘制并保存诊断图")
     parser.add_argument("--no-save", action="store_true", help="不保存训练好的模型")
     return parser.parse_args()
 
@@ -258,6 +268,49 @@ def evaluate_model(model: Pipeline, x_test: pd.DataFrame, y_test: pd.Series) -> 
     return metrics
 
 
+def save_diagnostic_plot(
+    y_true: pd.Series | np.ndarray,
+    y_pred: np.ndarray,
+    plot_out: Path,
+    model_name: str,
+) -> None:
+    """
+    保存回归诊断图：
+    1) 左图：按真实值排序后的真实曲线与预测曲线；
+    2) 右图：残差分布直方图。
+    """
+    y_true_array = np.asarray(y_true, dtype=float)
+    y_pred_array = np.asarray(y_pred, dtype=float)
+    residuals = y_true_array - y_pred_array
+
+    sort_idx = np.argsort(y_true_array)
+    y_true_sorted = y_true_array[sort_idx]
+    y_pred_sorted = y_pred_array[sort_idx]
+
+    plot_out.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(y_true_sorted, label="Actual", linewidth=2.0, color="#1f77b4")
+    axes[0].plot(y_pred_sorted, label="Predicted", linewidth=2.0, color="#ff7f0e", alpha=0.85)
+    axes[0].set_title(f"{model_name}: Actual vs Predicted")
+    axes[0].set_xlabel("Samples sorted by actual value")
+    axes[0].set_ylabel("PM2.5")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend()
+
+    axes[1].hist(residuals, bins=30, color="#4c78a8", alpha=0.85, edgecolor="white")
+    axes[1].axvline(0.0, color="#d62728", linestyle="--", linewidth=1.5)
+    axes[1].set_title(f"{model_name}: Residual distribution")
+    axes[1].set_xlabel("Residual (actual - predicted)")
+    axes[1].set_ylabel("Count")
+    axes[1].grid(alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(plot_out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def print_top_importances(model: Pipeline, top_n: int = 20) -> None:
     """打印前 N 个最重要特征，帮助理解模型关注点。"""
     preprocess = model.named_steps["preprocess"]
@@ -284,6 +337,7 @@ def print_top_importances(model: Pipeline, top_n: int = 20) -> None:
 def main() -> None:
     """脚本主流程：读取数据 -> 划分数据 -> 调参/训练 -> 评估 -> 保存。"""
     args = parse_args()
+    plot_out = Path(args.plot_out)
 
     # 第一步：读取并校验数据
     data_path = Path(args.data)
@@ -362,6 +416,15 @@ def main() -> None:
     sample = pd.DataFrame({"actual": y_test.values[:10], "predicted": y_pred[:10]})
     print("\n测试集前 10 条预测：")
     print(sample.to_string(index=False))
+
+    if not args.no_plot:
+        save_diagnostic_plot(
+            y_true=y_test,
+            y_pred=y_pred,
+            plot_out=plot_out,
+            model_name="XGBoost Regression",
+        )
+        print(f"\n诊断图已保存到：{plot_out}")
 
     # 展示主要特征重要性，提升可解释性
     print_top_importances(best_model, top_n=20)
