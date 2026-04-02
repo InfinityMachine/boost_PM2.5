@@ -138,8 +138,33 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "当 --residual-model ensemble 时，手动指定 XGBoost 残差权重，范围 [0, 1]。"
-            "若不指定，则会根据交叉验证 RMSE 自动加权；默认：自动"
+            "若不指定，则会基于训练集 OOF 预测自动搜索权重；默认：自动"
         ),
+    )
+    parser.add_argument(
+        "--ensemble-weight-objective",
+        choices=["overall", "high_pm25", "blended"],
+        default="blended",
+        help=(
+            "双模型集成自动定权的优化目标：overall=按整体 RMSE 搜索权重，"
+            "high_pm25=按高污染子集 RMSE 搜索权重，"
+            "blended=同时兼顾整体 RMSE 与高污染子集 RMSE；默认：blended"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-blended-overall-weight",
+        type=float,
+        default=0.7,
+        help=(
+            "当 --ensemble-weight-objective blended 时，整体 RMSE 在联合目标中的权重，"
+            "范围 [0, 1]，默认：0.7"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-weight-grid-step",
+        type=float,
+        default=0.02,
+        help="双模型集成自动搜索权重时的步长，范围 (0, 1]，默认：0.02",
     )
     parser.add_argument(
         "--validation-mode",
@@ -436,6 +461,33 @@ def validate_group_folds(groups: pd.Series, n_splits: int, stage_name: str) -> N
         raise ValueError(
             f"{stage_name} 需要至少 {n_splits} 个不同分组，但当前只有 {unique_groups} 个。"
         )
+
+
+def build_cv_split_indices(
+    x_data: pd.DataFrame,
+    y_data: pd.Series,
+    groups_data: pd.Series | None,
+    cv_folds: int,
+    random_state: int,
+    validation_mode: str,
+    stage_name: str,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    统一构造交叉验证的索引切分。
+
+    这样做有两个好处：
+    1. 趋势模型、XGBoost 残差、CatBoost 残差都能复用同一套切分逻辑；
+    2. 后续如果要加入更多模型，验证策略仍然保持一致，便于公平比较。
+    """
+    if validation_mode == "group":
+        if groups_data is None:
+            raise ValueError(f"{stage_name} 在分组验证模式下需要 groups_data。")
+        validate_group_folds(groups_data, cv_folds, stage_name)
+        splitter = GroupKFold(n_splits=cv_folds)
+        return list(splitter.split(x_data, y_data, groups_data))
+
+    splitter = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+    return list(splitter.split(x_data, y_data))
 
 
 def split_train_test_by_group(
@@ -792,19 +844,19 @@ def generate_oof_trend_predictions(
     同一个地区不会同时出现在当前 fold 的训练子集和验证子集中，
     因而得到的是“跨地区泛化”的趋势预测。
     """
-    if validation_mode == "group":
-        if groups_train is None:
-            raise ValueError("分组验证模式下，groups_train 不能为空。")
-        validate_group_folds(groups_train, cv_folds, "趋势模型 GroupKFold")
-        splitter = GroupKFold(n_splits=cv_folds)
-        split_iter = splitter.split(x_train, y_train, groups_train)
-    else:
-        splitter = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-        split_iter = splitter.split(x_train, y_train)
+    split_indices = build_cv_split_indices(
+        x_data=x_train,
+        y_data=y_train,
+        groups_data=groups_train,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        validation_mode=validation_mode,
+        stage_name="趋势模型交叉验证",
+    )
 
     oof_pred = np.zeros(len(x_train), dtype=float)
 
-    for fold_no, (tr_idx, val_idx) in enumerate(split_iter, start=1):
+    for fold_no, (tr_idx, val_idx) in enumerate(split_indices, start=1):
         x_tr = x_train.iloc[tr_idx]
         y_tr = y_train.iloc[tr_idx]
         x_val = x_train.iloc[val_idx]
@@ -947,15 +999,15 @@ def tune_catboost_residual_model(
         ParameterSampler(param_space, n_iter=n_iter, random_state=random_state)
     )
 
-    if validation_mode == "group":
-        if groups_train is None:
-            raise ValueError("分组验证模式下，groups_train 不能为空。")
-        validate_group_folds(groups_train, cv_folds, "CatBoost 残差模型 GroupKFold")
-        splitter = GroupKFold(n_splits=cv_folds)
-        split_indices = list(splitter.split(x_train_cb, residual_target, groups_train))
-    else:
-        splitter = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-        split_indices = list(splitter.split(x_train_cb, residual_target))
+    split_indices = build_cv_split_indices(
+        x_data=x_train_cb,
+        y_data=residual_target,
+        groups_data=groups_train,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        validation_mode=validation_mode,
+        stage_name="CatBoost 残差模型交叉验证",
+    )
 
     best_params: dict[str, Any] | None = None
     best_cv_rmse = float("inf")
@@ -1115,9 +1167,248 @@ def predict_catboost_residual_model(
     return np.asarray(model.predict(pred_pool), dtype=float)
 
 
+def generate_oof_xgboost_residual_predictions(
+    x_train_aug: pd.DataFrame,
+    residual_target: pd.Series,
+    groups_train: pd.Series | None,
+    sample_weight: np.ndarray | None,
+    cv_folds: int,
+    random_state: int,
+    device: str,
+    gpu_id: int,
+    best_params: dict[str, Any] | None,
+    validation_mode: str,
+) -> np.ndarray:
+    """
+    生成 XGBoost 残差模型的 OOF 预测。
+
+    这些 OOF 残差预测不会直接用于最终上线预测，
+    而是专门用于“给双模型集成搜索权重”。
+    这样定权时看到的是更接近真实泛化场景的预测，而不是训练集拟合值。
+    """
+    split_indices = build_cv_split_indices(
+        x_data=x_train_aug,
+        y_data=residual_target,
+        groups_data=groups_train,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        validation_mode=validation_mode,
+        stage_name="XGBoost 残差 OOF",
+    )
+    oof_pred = np.zeros(len(x_train_aug), dtype=float)
+
+    for fold_no, (tr_idx, val_idx) in enumerate(split_indices, start=1):
+        x_tr = x_train_aug.iloc[tr_idx]
+        y_tr = residual_target.iloc[tr_idx]
+        x_val = x_train_aug.iloc[val_idx]
+        fold_weight = sample_weight[tr_idx] if sample_weight is not None else None
+
+        model = build_residual_pipeline(x_tr, random_state, device, gpu_id)
+        if best_params:
+            model.set_params(**best_params)
+
+        if fold_weight is None:
+            model.fit(x_tr, y_tr)
+        else:
+            model.fit(x_tr, y_tr, model__sample_weight=fold_weight)
+
+        fold_pred = model.predict(x_val)
+        oof_pred[val_idx] = fold_pred
+        fold_rmse = calculate_metrics(residual_target.iloc[val_idx], fold_pred)["RMSE"]
+        print(
+            f"[XGBoost OOF] fold {fold_no}/{cv_folds} residual RMSE={fold_rmse:.4f}"
+        )
+
+    return oof_pred
+
+
+def generate_oof_catboost_residual_predictions(
+    x_train_aug: pd.DataFrame,
+    residual_target: pd.Series,
+    groups_train: pd.Series | None,
+    sample_weight: np.ndarray | None,
+    cv_folds: int,
+    random_state: int,
+    device: str,
+    gpu_id: int,
+    best_params: dict[str, Any] | None,
+    validation_mode: str,
+) -> np.ndarray:
+    """
+    生成 CatBoost 残差模型的 OOF 预测。
+
+    这里使用固定参数直接训练每一折，
+    不在 OOF 阶段再做 early stopping，避免把验证折既当“评估”又当“调停止”的轻微偏乐观问题。
+    """
+    x_train_cb, categorical_cols = prepare_catboost_features(x_train_aug)
+    split_indices = build_cv_split_indices(
+        x_data=x_train_cb,
+        y_data=residual_target,
+        groups_data=groups_train,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        validation_mode=validation_mode,
+        stage_name="CatBoost 残差 OOF",
+    )
+    oof_pred = np.zeros(len(x_train_cb), dtype=float)
+    params = default_catboost_residual_params(random_state, device, gpu_id)
+    if best_params:
+        params.update(best_params)
+
+    for fold_no, (tr_idx, val_idx) in enumerate(split_indices, start=1):
+        x_tr = x_train_cb.iloc[tr_idx]
+        y_tr = residual_target.iloc[tr_idx]
+        x_val = x_train_cb.iloc[val_idx]
+        fold_weight = sample_weight[tr_idx] if sample_weight is not None else None
+
+        train_pool = Pool(
+            data=x_tr,
+            label=y_tr,
+            cat_features=categorical_cols,
+            weight=fold_weight,
+        )
+        valid_pool = Pool(data=x_val, cat_features=categorical_cols)
+
+        model = CatBoostRegressor(**params)
+        model.fit(train_pool, verbose=False)
+
+        fold_pred = np.asarray(model.predict(valid_pool), dtype=float)
+        oof_pred[val_idx] = fold_pred
+        fold_rmse = calculate_metrics(residual_target.iloc[val_idx], fold_pred)["RMSE"]
+        print(
+            f"[CatBoost OOF] fold {fold_no}/{cv_folds} residual RMSE={fold_rmse:.4f}"
+        )
+
+    return oof_pred
+
+
+def search_ensemble_weights_by_oof(
+    y_true: pd.Series,
+    trend_oof_pred: np.ndarray,
+    xgb_residual_oof_pred: np.ndarray,
+    cat_residual_oof_pred: np.ndarray,
+    objective: str,
+    high_pm25_threshold: float,
+    grid_step: float,
+    blended_overall_weight: float,
+) -> dict[str, Any]:
+    """
+    基于训练集 OOF 预测搜索双模型集成权重。
+
+    搜索目标有三种：
+    1. overall：让整体 OOF RMSE 最小；
+    2. high_pm25：让高污染子集 OOF RMSE 最小。
+    3. blended：同时兼顾整体 RMSE 和高污染 RMSE。
+
+    这里直接对权重做网格搜索，而不是只用单模型 RMSE 反推权重，
+    好处是能显式利用两个模型之间的互补性。
+    """
+    if not 0.0 < grid_step <= 1.0:
+        raise ValueError("ensemble-weight-grid-step 必须在 (0, 1] 之间。")
+    if not 0.0 <= blended_overall_weight <= 1.0:
+        raise ValueError("ensemble-blended-overall-weight 必须在 [0, 1] 之间。")
+
+    y_true_array = np.asarray(y_true, dtype=float)
+    trend_overall_rmse = calculate_metrics(y_true_array, trend_oof_pred)["RMSE"]
+    trend_high_metrics, trend_high_count = calculate_high_pm25_metrics(
+        y_true=y_true_array,
+        y_pred=trend_oof_pred,
+        threshold=high_pm25_threshold,
+    )
+    trend_high_rmse = trend_high_metrics["RMSE"]
+    trend_overall_scale = max(float(trend_overall_rmse), 1e-12)
+    trend_high_scale = (
+        max(float(trend_high_rmse), 1e-12)
+        if np.isfinite(trend_high_rmse)
+        else 1.0
+    )
+    best_result: dict[str, Any] | None = None
+    overall_sample_count = len(y_true_array)
+    weight_candidates = np.arange(0.0, 1.0 + grid_step / 2.0, grid_step)
+
+    for xgb_weight in weight_candidates:
+        cat_weight = 1.0 - float(xgb_weight)
+        residual_pred = (
+            float(xgb_weight) * xgb_residual_oof_pred
+            + cat_weight * cat_residual_oof_pred
+        )
+        final_pred = trend_oof_pred + residual_pred
+
+        overall_metrics = calculate_metrics(y_true_array, final_pred)
+        high_metrics, high_sample_count = calculate_high_pm25_metrics(
+            y_true=y_true_array,
+            y_pred=final_pred,
+            threshold=high_pm25_threshold,
+        )
+        overall_rmse = float(overall_metrics["RMSE"])
+        high_rmse = float(high_metrics["RMSE"])
+
+        if objective == "high_pm25":
+            objective_score = high_rmse
+            objective_metric = "RMSE"
+            objective_sample_count = high_sample_count
+        elif objective == "blended":
+            # 使用相对趋势基线的归一化 RMSE，避免高污染 RMSE 数值更大而天然主导目标。
+            normalized_overall = overall_rmse / trend_overall_scale
+            normalized_high = high_rmse / trend_high_scale
+            blended_high_weight = 1.0 - float(blended_overall_weight)
+            objective_score = (
+                float(blended_overall_weight) * normalized_overall
+                + blended_high_weight * normalized_high
+            )
+            objective_metric = "weighted_normalized_rmse"
+            objective_sample_count = overall_sample_count
+        else:
+            objective_score = overall_rmse
+            objective_metric = "RMSE"
+            objective_sample_count = overall_sample_count
+
+        candidate = {
+            "strategy": f"oof_grid_search_{objective}",
+            "objective": objective,
+            "objective_metric": objective_metric,
+            "objective_score": float(objective_score),
+            "objective_sample_count": int(objective_sample_count),
+            "xgb_weight": float(xgb_weight),
+            "catboost_weight": float(cat_weight),
+            "grid_step": float(grid_step),
+            "overall_rmse": overall_rmse,
+            "high_pm25_rmse": high_rmse,
+            "overall_sample_count": int(overall_sample_count),
+            "high_pm25_sample_count": int(high_sample_count),
+            "trend_overall_rmse": float(trend_overall_rmse),
+            "trend_high_pm25_rmse": float(trend_high_rmse),
+            "trend_high_pm25_sample_count": int(trend_high_count),
+        }
+
+        if objective == "blended":
+            candidate["blended_overall_weight"] = float(blended_overall_weight)
+            candidate["blended_high_weight"] = 1.0 - float(blended_overall_weight)
+            candidate["normalized_overall_rmse"] = overall_rmse / trend_overall_scale
+            candidate["normalized_high_pm25_rmse"] = high_rmse / trend_high_scale
+
+        if (
+            best_result is None
+            or candidate["objective_score"] < best_result["objective_score"]
+        ):
+            best_result = candidate
+
+    if best_result is None:
+        raise RuntimeError("双模型集成权重搜索失败：未产生有效候选。")
+    return best_result
+
+
 def resolve_ensemble_weights(
     residual_model: str,
     manual_weight_xgb: float | None,
+    ensemble_weight_objective: str,
+    ensemble_weight_grid_step: float,
+    ensemble_blended_overall_weight: float,
+    y_train: pd.Series,
+    trend_train_oof_pred: np.ndarray,
+    xgb_residual_oof_pred: np.ndarray | None,
+    cat_residual_oof_pred: np.ndarray | None,
+    high_pm25_threshold: float,
     xgb_cv_rmse: float | None,
     cat_cv_rmse: float | None,
 ) -> dict[str, Any]:
@@ -1126,12 +1417,14 @@ def resolve_ensemble_weights(
 
     权重策略：
     1. 如果用户显式给出 XGBoost 权重，则直接使用；
-    2. 否则，若两者都有交叉验证 RMSE，则按“RMSE 的倒数”自动加权；
-    3. 如果没有可用的交叉验证信息（例如 --no-tune），则退回等权平均。
+    2. 否则，优先使用 OOF 预测直接搜索最优权重；
+    3. 如果 OOF 预测不可用，再回退到基于单模型 CV RMSE 的倒数加权；
+    4. 如果仍不可用，则退回等权平均。
     """
     if residual_model != "ensemble":
         return {
             "strategy": "single_model",
+            "objective": "single_model",
             "xgb_weight": 1.0 if residual_model == "xgboost" else 0.0,
             "catboost_weight": 1.0 if residual_model == "catboost" else 0.0,
         }
@@ -1142,9 +1435,22 @@ def resolve_ensemble_weights(
         xgb_weight = float(manual_weight_xgb)
         return {
             "strategy": "manual",
+            "objective": "manual",
             "xgb_weight": xgb_weight,
             "catboost_weight": 1.0 - xgb_weight,
         }
+
+    if xgb_residual_oof_pred is not None and cat_residual_oof_pred is not None:
+        return search_ensemble_weights_by_oof(
+            y_true=y_train,
+            trend_oof_pred=trend_train_oof_pred,
+            xgb_residual_oof_pred=xgb_residual_oof_pred,
+            cat_residual_oof_pred=cat_residual_oof_pred,
+            objective=ensemble_weight_objective,
+            high_pm25_threshold=high_pm25_threshold,
+            grid_step=ensemble_weight_grid_step,
+            blended_overall_weight=ensemble_blended_overall_weight,
+        )
 
     if (
         xgb_cv_rmse is not None
@@ -1159,12 +1465,14 @@ def resolve_ensemble_weights(
         total = inv_xgb + inv_cat
         return {
             "strategy": "inverse_cv_rmse",
+            "objective": "overall",
             "xgb_weight": inv_xgb / total,
             "catboost_weight": inv_cat / total,
         }
 
     return {
         "strategy": "equal_fallback",
+        "objective": "overall",
         "xgb_weight": 0.5,
         "catboost_weight": 0.5,
     }
@@ -1420,6 +1728,8 @@ def main() -> None:
     cat_best_cv_rmse: float | None = None
     xgb_residual_model: Pipeline | None = None
     catboost_residual_model: CatBoostRegressor | None = None
+    xgb_residual_train_oof_pred: np.ndarray | None = None
+    cat_residual_train_oof_pred: np.ndarray | None = None
     catboost_feature_cols: list[str] = []
     catboost_categorical_cols: list[str] = []
 
@@ -1515,9 +1825,69 @@ def main() -> None:
                 ) from exc
             raise
 
+    if args.residual_model == "ensemble" and args.ensemble_weight_xgb is None:
+        print(
+            "[信息] 开始基于 OOF 预测搜索双模型集成权重："
+            f"objective={args.ensemble_weight_objective}, "
+            f"grid_step={args.ensemble_weight_grid_step}, "
+            f"blended_overall_weight={args.ensemble_blended_overall_weight:.2f}"
+        )
+        if xgb_residual_model is None or catboost_residual_model is None:
+            raise RuntimeError("自动搜索集成权重前，必须先成功训练 XGBoost 和 CatBoost 残差模型。")
+
+        try:
+            xgb_residual_train_oof_pred = generate_oof_xgboost_residual_predictions(
+                x_train_aug=x_train_aug_for_tune,
+                residual_target=residual_train_oof,
+                groups_train=groups_train,
+                sample_weight=residual_sample_weight,
+                cv_folds=args.residual_cv_folds,
+                random_state=args.random_state,
+                device=args.device,
+                gpu_id=args.gpu_id,
+                best_params=xgb_best_params,
+                validation_mode=args.validation_mode,
+            )
+        except XGBoostError as exc:
+            if args.device == "gpu":
+                raise SystemExit(
+                    "XGBoost GPU 训练失败。请确认 CUDA 驱动/显卡可用，或改用 --device cpu。\n"
+                    f"原始错误：{exc}"
+                ) from exc
+            raise
+
+        try:
+            cat_residual_train_oof_pred = generate_oof_catboost_residual_predictions(
+                x_train_aug=x_train_aug_for_tune,
+                residual_target=residual_train_oof,
+                groups_train=groups_train,
+                sample_weight=residual_sample_weight,
+                cv_folds=args.residual_cv_folds,
+                random_state=args.random_state,
+                device=args.device,
+                gpu_id=args.gpu_id,
+                best_params=cat_best_params,
+                validation_mode=args.validation_mode,
+            )
+        except CatBoostError as exc:
+            if args.device == "gpu":
+                raise SystemExit(
+                    "CatBoost GPU 训练失败。请确认 CUDA 驱动/显卡可用，或改用 --device cpu。\n"
+                    f"原始错误：{exc}"
+                ) from exc
+            raise
+
     ensemble_config = resolve_ensemble_weights(
         residual_model=args.residual_model,
         manual_weight_xgb=args.ensemble_weight_xgb,
+        ensemble_weight_objective=args.ensemble_weight_objective,
+        ensemble_weight_grid_step=args.ensemble_weight_grid_step,
+        ensemble_blended_overall_weight=args.ensemble_blended_overall_weight,
+        y_train=y_train,
+        trend_train_oof_pred=trend_train_oof_pred,
+        xgb_residual_oof_pred=xgb_residual_train_oof_pred,
+        cat_residual_oof_pred=cat_residual_train_oof_pred,
+        high_pm25_threshold=high_pm25_eval_config["threshold"],
         xgb_cv_rmse=xgb_best_cv_rmse,
         cat_cv_rmse=cat_best_cv_rmse,
     )
@@ -1611,6 +1981,24 @@ def main() -> None:
             f"(xgb={ensemble_config['xgb_weight']:.4f}, "
             f"cat={ensemble_config['catboost_weight']:.4f})"
         )
+        print(f"集成权重目标                : {ensemble_config.get('objective', 'overall')}")
+        if "objective_score" in ensemble_config:
+            print(
+                "集成目标分数                : "
+                f"{ensemble_config['objective_metric']}={ensemble_config['objective_score']:.4f} "
+                f"(samples={ensemble_config['objective_sample_count']})"
+            )
+        if ensemble_config.get("objective") == "blended":
+            print(
+                "联合目标权重                : "
+                f"overall={ensemble_config['blended_overall_weight']:.2f}, "
+                f"high_pm25={ensemble_config['blended_high_weight']:.2f}"
+            )
+            print(
+                "OOF 融合候选指标            : "
+                f"overall_RMSE={ensemble_config['overall_rmse']:.4f}, "
+                f"high_pm25_RMSE={ensemble_config['high_pm25_rmse']:.4f}"
+            )
     print(f"趋势模型 测试集 RMSE        : {trend_metrics['RMSE']:.4f}")
     print(f"趋势模型 测试集 MAE         : {trend_metrics['MAE']:.4f}")
     print(f"趋势模型 测试集 R^2         : {trend_metrics['R2']:.4f}")
