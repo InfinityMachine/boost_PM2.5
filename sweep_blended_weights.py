@@ -37,6 +37,7 @@ from train_pm25_trend_residual_xgboost import (
     calculate_high_pm25_metrics,
     calculate_metrics,
     compute_sample_weights,
+    default_xgb_residual_params,
     describe_sample_weighting,
     describe_trend_model,
     fit_final_catboost_residual_model,
@@ -49,6 +50,7 @@ from train_pm25_trend_residual_xgboost import (
     make_augmented_features,
     parse_feature_list,
     predict_catboost_residual_model,
+    prepare_xgb_residual_features,
     remove_identifier_columns,
     resolve_ensemble_weights,
     resolve_groups,
@@ -164,6 +166,26 @@ def parse_args() -> argparse.Namespace:
         "--keep-id-cols",
         action="store_true",
         help="保留疑似 ID 列（默认会自动剔除）",
+    )
+    parser.add_argument(
+        "--xgb-feature-view",
+        choices=["auto", "all", "complementary"],
+        default="auto",
+        help=(
+            "XGBoost 残差模型的特征视图："
+            "all=保留全部特征，complementary=弱化高基数类别并增强数值交互，"
+            "auto=在本实验脚本中默认按 ensemble 逻辑自动选择；默认：auto"
+        ),
+    )
+    parser.add_argument(
+        "--xgb-complementary-drop-cols",
+        default="CITY,COUNTY",
+        help="XGBoost complementary 视图中需要移除的高基数列，逗号分隔",
+    )
+    parser.add_argument(
+        "--no-xgb-complementary-interactions",
+        action="store_true",
+        help="关闭 XGBoost complementary 视图下的默认数值交互特征",
     )
     parser.add_argument(
         "--weights",
@@ -372,6 +394,55 @@ def main() -> None:
     x_train_aug_for_tune = make_augmented_features(x_train, trend_train_oof_pred)
     x_train_aug_for_fit = x_train_aug_for_tune.copy()
     x_test_aug = make_augmented_features(x_test, trend_test_pred)
+    xgb_train_aug_for_tune, xgb_feature_view_info = prepare_xgb_residual_features(
+        x=x_train_aug_for_tune,
+        residual_model="ensemble",
+        xgb_feature_view=args.xgb_feature_view,
+        complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_complementary_interactions=not args.no_xgb_complementary_interactions,
+    )
+    xgb_train_aug_for_fit, _ = prepare_xgb_residual_features(
+        x=x_train_aug_for_fit,
+        residual_model="ensemble",
+        xgb_feature_view=args.xgb_feature_view,
+        complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_complementary_interactions=not args.no_xgb_complementary_interactions,
+    )
+    xgb_test_aug, _ = prepare_xgb_residual_features(
+        x=x_test_aug,
+        residual_model="ensemble",
+        xgb_feature_view=args.xgb_feature_view,
+        complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_complementary_interactions=not args.no_xgb_complementary_interactions,
+    )
+    print(f"[信息] XGBoost 特征视图：{xgb_feature_view_info['effective_view']}")
+    xgb_default_param_profile = default_xgb_residual_params(
+        random_state=args.random_state,
+        device=args.device,
+        gpu_id=args.gpu_id,
+        xgb_effective_view=xgb_feature_view_info["effective_view"],
+    )
+    print(
+        "[信息] XGBoost 默认参数摘要："
+        f"max_depth={xgb_default_param_profile['max_depth']}, "
+        f"min_child_weight={xgb_default_param_profile['min_child_weight']}, "
+        f"learning_rate={xgb_default_param_profile['learning_rate']}, "
+        f"subsample={xgb_default_param_profile['subsample']}, "
+        f"colsample_bytree={xgb_default_param_profile['colsample_bytree']}, "
+        f"reg_alpha={xgb_default_param_profile['reg_alpha']}, "
+        f"reg_lambda={xgb_default_param_profile['reg_lambda']}, "
+        f"gamma={xgb_default_param_profile['gamma']}"
+    )
+    if xgb_feature_view_info["dropped_cols"]:
+        print(
+            "[信息] XGBoost 已移除的高基数列："
+            f"{xgb_feature_view_info['dropped_cols']}"
+        )
+    if xgb_feature_view_info["added_interaction_cols"]:
+        print(
+            "[信息] XGBoost 新增交互特征："
+            f"{xgb_feature_view_info['added_interaction_cols']}"
+        )
 
     # 5) 训练 XGBoost 残差
     xgb_best_params = None
@@ -385,14 +456,15 @@ def main() -> None:
                 f"residual_cv_folds={args.residual_cv_folds}"
             )
             xgb_tune_pipeline = build_residual_pipeline(
-                x_train_aug_for_tune,
+                xgb_train_aug_for_tune,
                 args.random_state,
                 args.device,
                 args.gpu_id,
+                xgb_feature_view_info["effective_view"],
             )
             xgb_best_params, xgb_best_cv_rmse = tune_residual_model(
                 pipeline=xgb_tune_pipeline,
-                x_train_aug=x_train_aug_for_tune,
+                x_train_aug=xgb_train_aug_for_tune,
                 residual_target=residual_train_oof,
                 groups_train=groups_train,
                 sample_weight=residual_sample_weight,
@@ -401,15 +473,17 @@ def main() -> None:
                 random_state=args.random_state,
                 device=args.device,
                 validation_mode=args.validation_mode,
+                xgb_effective_view=xgb_feature_view_info["effective_view"],
             )
 
         xgb_residual_model = fit_final_residual_model(
-            x_train_aug=x_train_aug_for_fit,
+            x_train_aug=xgb_train_aug_for_fit,
             residual_target=residual_train_oof,
             sample_weight=residual_sample_weight,
             random_state=args.random_state,
             device=args.device,
             gpu_id=args.gpu_id,
+            xgb_effective_view=xgb_feature_view_info["effective_view"],
             best_params=xgb_best_params,
         )
     except XGBoostError as exc:
@@ -470,7 +544,7 @@ def main() -> None:
         raise
 
     # 7) 生成两类残差模型的测试集预测与 OOF 预测
-    xgb_residual_test_pred = xgb_residual_model.predict(x_test_aug)
+    xgb_residual_test_pred = xgb_residual_model.predict(xgb_test_aug)
     cat_residual_test_pred = predict_catboost_residual_model(
         model=catboost_residual_model,
         x_aug=x_test_aug,
@@ -480,7 +554,7 @@ def main() -> None:
 
     print("[信息] 开始生成 XGBoost / CatBoost 残差 OOF 预测，用于扫描集成权重。")
     xgb_residual_train_oof_pred = generate_oof_xgboost_residual_predictions(
-        x_train_aug=x_train_aug_for_tune,
+        x_train_aug=xgb_train_aug_for_tune,
         residual_target=residual_train_oof,
         groups_train=groups_train,
         sample_weight=residual_sample_weight,
@@ -488,6 +562,7 @@ def main() -> None:
         random_state=args.random_state,
         device=args.device,
         gpu_id=args.gpu_id,
+        xgb_effective_view=xgb_feature_view_info["effective_view"],
         best_params=xgb_best_params,
         validation_mode=args.validation_mode,
     )

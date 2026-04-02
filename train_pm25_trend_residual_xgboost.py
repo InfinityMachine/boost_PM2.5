@@ -61,6 +61,7 @@ import matplotlib.pyplot as plt
 TREND_FEATURE_NAME = "__linear_trend_pred__"
 DEFAULT_RIDGE_ALPHAS = np.logspace(-3, 3, 13)
 DEFAULT_LOG_FEATURE_CANDIDATES = ("NOX", "SO2", "fertilzier", "manure")
+DEFAULT_XGB_COMPLEMENTARY_DROP_COLS = ("CITY", "COUNTY")
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,6 +132,30 @@ def parse_args() -> argparse.Namespace:
             "残差模型类型：xgboost=仅用 XGBoost，"
             "catboost=仅用 CatBoost，ensemble=双模型加权集成；默认：xgboost"
         ),
+    )
+    parser.add_argument(
+        "--xgb-feature-view",
+        choices=["auto", "all", "complementary"],
+        default="auto",
+        help=(
+            "XGBoost 残差模型的特征视图："
+            "all=保留全部特征，"
+            "complementary=更强调数值非线性并弱化高基数地区类别，"
+            "auto=在 ensemble 模式下自动使用 complementary，其它模式使用 all；默认：auto"
+        ),
+    )
+    parser.add_argument(
+        "--xgb-complementary-drop-cols",
+        default="CITY,COUNTY",
+        help=(
+            "当 XGBoost 特征视图为 complementary 时，需要从 XGBoost 侧移除的高基数列，"
+            "逗号分隔。默认：CITY,COUNTY"
+        ),
+    )
+    parser.add_argument(
+        "--no-xgb-complementary-interactions",
+        action="store_true",
+        help="关闭 XGBoost complementary 视图下的默认数值交互特征",
     )
     parser.add_argument(
         "--ensemble-weight-xgb",
@@ -301,6 +326,225 @@ def parse_feature_list(raw_text: str) -> list[str]:
     if not raw_text.strip():
         return list(DEFAULT_LOG_FEATURE_CANDIDATES)
     return [item.strip() for item in raw_text.split(",") if item.strip()]
+
+
+def resolve_xgb_feature_view(
+    requested_view: str,
+    residual_model: str,
+) -> str:
+    """
+    解析 XGBoost 残差模型实际使用的特征视图。
+
+    设计思路：
+    1. 单独使用 XGBoost 时，默认保留全部特征，追求单模型上限；
+    2. 做双模型集成时，默认让 XGBoost 更偏向“数值非线性 + 交互修正”，
+       把高基数类别结构更多留给 CatBoost，从而增强两者互补性。
+    """
+    if requested_view != "auto":
+        return requested_view
+    return "complementary" if residual_model == "ensemble" else "all"
+
+
+def build_xgb_interaction_features(
+    x: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """
+    为 XGBoost 的 complementary 视图构建一组数值交互特征。
+
+    这些特征的目标不是让模型“更复杂”本身，
+    而是有意引导 XGBoost 更专注于连续变量之间的局部非线性关系。
+    CatBoost 仍然负责完整的地区类别结构与类别交互。
+    """
+    x_new = x.copy()
+    added_cols: list[str] = []
+    skipped_rules: list[str] = []
+
+    def get_numeric_series(col: str) -> pd.Series | None:
+        if col not in x_new.columns:
+            return None
+        return pd.to_numeric(x_new[col], errors="coerce")
+
+    interaction_rules = [
+        ("NOX_x_SO2", "mul", ("NOX", "SO2")),
+        ("NOX_x_wind", "mul", ("NOX", "wind")),
+        ("SO2_x_wind", "mul", ("SO2", "wind")),
+        ("tem_x_ppt", "mul", ("tem", "ppt")),
+        ("AET_x_ppt", "mul", ("AET", "ppt")),
+        ("fertilzier_plus_manure", "add", ("fertilzier", "manure")),
+        ("NOX_div_wind", "div", ("NOX", "wind")),
+        ("SO2_div_wind", "div", ("SO2", "wind")),
+    ]
+
+    for new_col, op_name, source_cols in interaction_rules:
+        left = get_numeric_series(source_cols[0])
+        right = get_numeric_series(source_cols[1])
+        if left is None or right is None:
+            skipped_rules.append(f"{new_col}(缺少源列)")
+            continue
+
+        if op_name == "mul":
+            x_new[new_col] = left * right
+        elif op_name == "add":
+            x_new[new_col] = left + right
+        elif op_name == "div":
+            # 给分母加 1，并取绝对值，降低极小风速带来的比值爆炸风险。
+            denominator = right.abs() + 1.0
+            x_new[new_col] = left / denominator
+        else:
+            skipped_rules.append(f"{new_col}(未知操作)")
+            continue
+
+        added_cols.append(new_col)
+
+    return x_new, added_cols, skipped_rules
+
+
+def prepare_xgb_residual_features(
+    x: pd.DataFrame,
+    residual_model: str,
+    xgb_feature_view: str,
+    complementary_drop_cols: list[str],
+    add_complementary_interactions: bool,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    为 XGBoost 残差模型构建专用特征视图。
+
+    `all` 视图：
+    - 保留当前所有特征，适合单独把 XGBoost 当成主力模型。
+
+    `complementary` 视图：
+    - 默认移除高基数地区列，例如 CITY / COUNTY；
+    - 可选新增一组数值交互特征；
+    - 目标是让 XGBoost 少“记地区”，多学连续变量的非线性和交互，
+      从而与保留完整类别结构的 CatBoost 形成更清晰的分工。
+    """
+    effective_view = resolve_xgb_feature_view(xgb_feature_view, residual_model)
+    x_new = x.copy()
+    dropped_cols: list[str] = []
+    added_interaction_cols: list[str] = []
+    skipped_interaction_rules: list[str] = []
+
+    if effective_view == "complementary":
+        drop_cols = [col for col in complementary_drop_cols if col in x_new.columns]
+        if drop_cols:
+            x_new = x_new.drop(columns=drop_cols)
+            dropped_cols.extend(drop_cols)
+
+        if add_complementary_interactions:
+            x_new, added_interaction_cols, skipped_interaction_rules = (
+                build_xgb_interaction_features(x_new)
+            )
+
+    info = {
+        "requested_view": xgb_feature_view,
+        "effective_view": effective_view,
+        "dropped_cols": dropped_cols,
+        "added_interaction_cols": added_interaction_cols,
+        "skipped_interaction_rules": skipped_interaction_rules,
+    }
+    return x_new, info
+
+
+def default_xgb_residual_params(
+    random_state: int,
+    device: str,
+    gpu_id: int,
+    xgb_effective_view: str,
+) -> dict[str, Any]:
+    """
+    返回 XGBoost 残差模型的默认参数。
+
+    这里针对两种视图采用不同策略：
+    1. `all`：保留原先较通用的配置，兼顾拟合能力与稳健性；
+    2. `complementary`：采用更收紧的“峰值修正”配置，
+       让 XGBoost 更像一个保守的局部修正器，而不是重新拟合全局结构。
+    """
+    if xgb_effective_view == "complementary":
+        model_kwargs: dict[str, Any] = {
+            "objective": "reg:squarederror",
+            "n_estimators": 500,
+            "learning_rate": 0.03,
+            "max_depth": 4,
+            "min_child_weight": 6,
+            "subsample": 0.75,
+            "colsample_bytree": 0.70,
+            "gamma": 0.2,
+            "reg_alpha": 0.2,
+            "reg_lambda": 4.0,
+            "random_state": random_state,
+        }
+    else:
+        model_kwargs = {
+            "objective": "reg:squarederror",
+            "n_estimators": 600,
+            "learning_rate": 0.05,
+            "max_depth": 5,
+            "min_child_weight": 3,
+            "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "gamma": 0.0,
+            "reg_alpha": 0.0,
+            "reg_lambda": 1.0,
+            "random_state": random_state,
+        }
+
+    if device == "gpu":
+        model_kwargs.update(
+            {
+                "tree_method": "hist",
+                "device": f"cuda:{gpu_id}",
+                "n_jobs": 1,
+            }
+        )
+    else:
+        model_kwargs.update(
+            {
+                "tree_method": "hist",
+                "n_jobs": -1,
+            }
+        )
+
+    return model_kwargs
+
+
+def default_xgb_param_distributions(
+    xgb_effective_view: str,
+) -> dict[str, list[Any]]:
+    """
+    返回 XGBoost 随机搜索的参数空间。
+
+    `complementary` 视图会使用更收紧的搜索范围：
+    - 更浅的树；
+    - 更高的最小叶子样本约束；
+    - 更强的正则；
+    - 更低的采样比例与学习率。
+
+    这样做的目标不是单模型最强，而是让它更专注于“修正局部偏差和峰值”。
+    """
+    if xgb_effective_view == "complementary":
+        return {
+            "model__n_estimators": [300, 400, 500, 700],
+            "model__learning_rate": [0.015, 0.02, 0.03, 0.05],
+            "model__max_depth": [3, 4, 5],
+            "model__min_child_weight": [4, 6, 8, 10],
+            "model__subsample": [0.65, 0.7, 0.75, 0.8, 0.85],
+            "model__colsample_bytree": [0.55, 0.65, 0.7, 0.8],
+            "model__gamma": [0.1, 0.2, 0.5, 1.0],
+            "model__reg_alpha": [0.05, 0.1, 0.2, 0.5, 1.0],
+            "model__reg_lambda": [2.0, 3.0, 4.0, 5.0, 8.0],
+        }
+
+    return {
+        "model__n_estimators": [300, 500, 700, 900],
+        "model__learning_rate": [0.02, 0.03, 0.05, 0.08],
+        "model__max_depth": [3, 4, 5, 6, 8],
+        "model__min_child_weight": [1, 2, 3, 5, 8],
+        "model__subsample": [0.7, 0.8, 0.85, 0.9, 1.0],
+        "model__colsample_bytree": [0.7, 0.8, 0.85, 0.9, 1.0],
+        "model__gamma": [0.0, 0.1, 0.2, 0.5],
+        "model__reg_alpha": [0.0, 0.01, 0.1, 1.0],
+        "model__reg_lambda": [0.5, 1.0, 2.0, 5.0],
+    }
 
 
 def add_log_transformed_features(
@@ -615,6 +859,7 @@ def build_residual_pipeline(
     random_state: int,
     device: str,
     gpu_id: int,
+    xgb_effective_view: str,
 ) -> Pipeline:
     """
     构建残差预测模型。
@@ -646,34 +891,12 @@ def build_residual_pipeline(
         remainder="drop",
     )
 
-    model_kwargs: dict[str, Any] = {
-        "objective": "reg:squarederror",
-        "n_estimators": 600,
-        "learning_rate": 0.05,
-        "max_depth": 5,
-        "min_child_weight": 3,
-        "subsample": 0.85,
-        "colsample_bytree": 0.85,
-        "reg_alpha": 0.0,
-        "reg_lambda": 1.0,
-        "random_state": random_state,
-    }
-
-    if device == "gpu":
-        model_kwargs.update(
-            {
-                "tree_method": "hist",
-                "device": f"cuda:{gpu_id}",
-                "n_jobs": 1,
-            }
-        )
-    else:
-        model_kwargs.update(
-            {
-                "tree_method": "hist",
-                "n_jobs": -1,
-            }
-        )
+    model_kwargs = default_xgb_residual_params(
+        random_state=random_state,
+        device=device,
+        gpu_id=gpu_id,
+        xgb_effective_view=xgb_effective_view,
+    )
 
     return Pipeline(
         steps=[
@@ -918,19 +1141,10 @@ def tune_residual_model(
     random_state: int,
     device: str,
     validation_mode: str,
+    xgb_effective_view: str,
 ) -> tuple[dict[str, Any], float]:
     """对 XGBoost 残差模型做随机搜索调参。"""
-    param_distributions: dict[str, Any] = {
-        "model__n_estimators": [300, 500, 700, 900],
-        "model__learning_rate": [0.02, 0.03, 0.05, 0.08],
-        "model__max_depth": [3, 4, 5, 6, 8],
-        "model__min_child_weight": [1, 2, 3, 5, 8],
-        "model__subsample": [0.7, 0.8, 0.85, 0.9, 1.0],
-        "model__colsample_bytree": [0.7, 0.8, 0.85, 0.9, 1.0],
-        "model__gamma": [0.0, 0.1, 0.2, 0.5],
-        "model__reg_alpha": [0.0, 0.01, 0.1, 1.0],
-        "model__reg_lambda": [0.5, 1.0, 2.0, 5.0],
-    }
+    param_distributions = default_xgb_param_distributions(xgb_effective_view)
 
     if validation_mode == "group":
         if groups_train is None:
@@ -1070,10 +1284,17 @@ def fit_final_residual_model(
     random_state: int,
     device: str,
     gpu_id: int,
+    xgb_effective_view: str,
     best_params: dict[str, Any] | None,
 ) -> Pipeline:
     """使用完整训练集上的残差重新训练最终 XGBoost 模型。"""
-    residual_model = build_residual_pipeline(x_train_aug, random_state, device, gpu_id)
+    residual_model = build_residual_pipeline(
+        x_train_aug,
+        random_state,
+        device,
+        gpu_id,
+        xgb_effective_view,
+    )
     if best_params:
         residual_model.set_params(**best_params)
     if sample_weight is None:
@@ -1176,6 +1397,7 @@ def generate_oof_xgboost_residual_predictions(
     random_state: int,
     device: str,
     gpu_id: int,
+    xgb_effective_view: str,
     best_params: dict[str, Any] | None,
     validation_mode: str,
 ) -> np.ndarray:
@@ -1203,7 +1425,13 @@ def generate_oof_xgboost_residual_predictions(
         x_val = x_train_aug.iloc[val_idx]
         fold_weight = sample_weight[tr_idx] if sample_weight is not None else None
 
-        model = build_residual_pipeline(x_tr, random_state, device, gpu_id)
+        model = build_residual_pipeline(
+            x_tr,
+            random_state,
+            device,
+            gpu_id,
+            xgb_effective_view,
+        )
         if best_params:
             model.set_params(**best_params)
 
@@ -1541,6 +1769,7 @@ def save_artifact(
     trend_model: Pipeline,
     residual_model_mode: str,
     xgboost_residual_model: Pipeline | None,
+    xgboost_feature_view_info: dict[str, Any],
     catboost_residual_model: CatBoostRegressor | None,
     catboost_feature_cols: list[str],
     catboost_categorical_cols: list[str],
@@ -1574,6 +1803,7 @@ def save_artifact(
             "xgboost": xgboost_residual_model,
             "catboost": catboost_residual_model,
         },
+        "xgboost_feature_view_info": xgboost_feature_view_info,
         "catboost_feature_cols": catboost_feature_cols,
         "catboost_categorical_cols": catboost_categorical_cols,
         "ensemble_config": ensemble_config,
@@ -1722,6 +1952,63 @@ def main() -> None:
     x_train_aug_for_fit = x_train_aug_for_tune.copy()
     x_test_aug = make_augmented_features(x_test, trend_test_pred)
 
+    xgb_feature_view_requested = args.xgb_feature_view
+    xgb_complementary_drop_cols = parse_feature_list(args.xgb_complementary_drop_cols)
+    xgb_add_complementary_interactions = not args.no_xgb_complementary_interactions
+    xgb_train_aug_for_tune, xgb_feature_view_info = prepare_xgb_residual_features(
+        x=x_train_aug_for_tune,
+        residual_model=args.residual_model,
+        xgb_feature_view=xgb_feature_view_requested,
+        complementary_drop_cols=xgb_complementary_drop_cols,
+        add_complementary_interactions=xgb_add_complementary_interactions,
+    )
+    xgb_train_aug_for_fit, _ = prepare_xgb_residual_features(
+        x=x_train_aug_for_fit,
+        residual_model=args.residual_model,
+        xgb_feature_view=xgb_feature_view_requested,
+        complementary_drop_cols=xgb_complementary_drop_cols,
+        add_complementary_interactions=xgb_add_complementary_interactions,
+    )
+    xgb_test_aug, _ = prepare_xgb_residual_features(
+        x=x_test_aug,
+        residual_model=args.residual_model,
+        xgb_feature_view=xgb_feature_view_requested,
+        complementary_drop_cols=xgb_complementary_drop_cols,
+        add_complementary_interactions=xgb_add_complementary_interactions,
+    )
+
+    print(
+        "[信息] XGBoost 特征视图："
+        f"{xgb_feature_view_info['effective_view']}"
+    )
+    xgb_default_param_profile = default_xgb_residual_params(
+        random_state=args.random_state,
+        device=args.device,
+        gpu_id=args.gpu_id,
+        xgb_effective_view=xgb_feature_view_info["effective_view"],
+    )
+    print(
+        "[信息] XGBoost 默认参数摘要："
+        f"max_depth={xgb_default_param_profile['max_depth']}, "
+        f"min_child_weight={xgb_default_param_profile['min_child_weight']}, "
+        f"learning_rate={xgb_default_param_profile['learning_rate']}, "
+        f"subsample={xgb_default_param_profile['subsample']}, "
+        f"colsample_bytree={xgb_default_param_profile['colsample_bytree']}, "
+        f"reg_alpha={xgb_default_param_profile['reg_alpha']}, "
+        f"reg_lambda={xgb_default_param_profile['reg_lambda']}, "
+        f"gamma={xgb_default_param_profile['gamma']}"
+    )
+    if xgb_feature_view_info["dropped_cols"]:
+        print(
+            "[信息] XGBoost 已移除的高基数列："
+            f"{xgb_feature_view_info['dropped_cols']}"
+        )
+    if xgb_feature_view_info["added_interaction_cols"]:
+        print(
+            "[信息] XGBoost 新增交互特征："
+            f"{xgb_feature_view_info['added_interaction_cols']}"
+        )
+
     xgb_best_params: dict[str, Any] | None = None
     xgb_best_cv_rmse: float | None = None
     cat_best_params: dict[str, Any] | None = None
@@ -1743,14 +2030,15 @@ def main() -> None:
                     f"residual_cv_folds={args.residual_cv_folds}"
                 )
                 residual_pipeline_for_tune = build_residual_pipeline(
-                    x_train_aug_for_tune,
+                    xgb_train_aug_for_tune,
                     args.random_state,
                     args.device,
                     args.gpu_id,
+                    xgb_feature_view_info["effective_view"],
                 )
                 xgb_best_params, xgb_best_cv_rmse = tune_residual_model(
                     pipeline=residual_pipeline_for_tune,
-                    x_train_aug=x_train_aug_for_tune,
+                    x_train_aug=xgb_train_aug_for_tune,
                     residual_target=residual_train_oof,
                     groups_train=groups_train,
                     sample_weight=residual_sample_weight,
@@ -1759,15 +2047,17 @@ def main() -> None:
                     random_state=args.random_state,
                     device=args.device,
                     validation_mode=args.validation_mode,
+                    xgb_effective_view=xgb_feature_view_info["effective_view"],
                 )
 
             xgb_residual_model = fit_final_residual_model(
-                x_train_aug=x_train_aug_for_fit,
+                x_train_aug=xgb_train_aug_for_fit,
                 residual_target=residual_train_oof,
                 sample_weight=residual_sample_weight,
                 random_state=args.random_state,
                 device=args.device,
                 gpu_id=args.gpu_id,
+                xgb_effective_view=xgb_feature_view_info["effective_view"],
                 best_params=xgb_best_params,
             )
         except XGBoostError as exc:
@@ -1837,7 +2127,7 @@ def main() -> None:
 
         try:
             xgb_residual_train_oof_pred = generate_oof_xgboost_residual_predictions(
-                x_train_aug=x_train_aug_for_tune,
+                x_train_aug=xgb_train_aug_for_tune,
                 residual_target=residual_train_oof,
                 groups_train=groups_train,
                 sample_weight=residual_sample_weight,
@@ -1845,6 +2135,7 @@ def main() -> None:
                 random_state=args.random_state,
                 device=args.device,
                 gpu_id=args.gpu_id,
+                xgb_effective_view=xgb_feature_view_info["effective_view"],
                 best_params=xgb_best_params,
                 validation_mode=args.validation_mode,
             )
@@ -1902,7 +2193,7 @@ def main() -> None:
     cat_hybrid_metrics: dict[str, float] | None = None
 
     if xgb_residual_model is not None:
-        xgb_residual_test_pred = xgb_residual_model.predict(x_test_aug)
+        xgb_residual_test_pred = xgb_residual_model.predict(xgb_test_aug)
         xgb_final_test_pred = trend_test_pred + xgb_residual_test_pred
         xgb_hybrid_metrics = calculate_metrics(y_test, xgb_final_test_pred)
 
@@ -1966,6 +2257,7 @@ def main() -> None:
     print(f"样本数（总/训练/测试）       : {len(x)} / {len(x_train)} / {len(x_test)}")
     print(f"趋势模型                    : {describe_trend_model(trend_model)}")
     print(f"残差模型模式                : {args.residual_model}")
+    print(f"XGBoost 特征视图            : {xgb_feature_view_info['effective_view']}")
     print(f"验证方式                    : {args.validation_mode}")
     if args.validation_mode == "group":
         print(f"分组列                      : {args.group_col}")
@@ -2076,6 +2368,7 @@ def main() -> None:
             trend_model=trend_model,
             residual_model_mode=args.residual_model,
             xgboost_residual_model=xgb_residual_model,
+            xgboost_feature_view_info=xgb_feature_view_info,
             catboost_residual_model=catboost_residual_model,
             catboost_feature_cols=catboost_feature_cols,
             catboost_categorical_cols=catboost_categorical_cols,
