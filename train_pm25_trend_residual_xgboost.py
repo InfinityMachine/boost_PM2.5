@@ -63,6 +63,7 @@ TREND_FEATURE_NAME = "__linear_trend_pred__"
 DEFAULT_RIDGE_ALPHAS = np.logspace(-3, 3, 13)
 DEFAULT_LOG_FEATURE_CANDIDATES = ("NOX", "SO2", "fertilzier", "manure")
 DEFAULT_XGB_COMPLEMENTARY_DROP_COLS = ("CITY", "COUNTY")
+DEFAULT_REGION_PRIOR_COLS = ("PROVINCE", "CITY")
 DEFAULT_XGB_ALL_INTERACTION_RULES = (
     ("NOX_x_SO2", "mul", ("NOX", "SO2")),
     ("NOX_x_wind", "mul", ("NOX", "wind")),
@@ -135,6 +136,25 @@ def parse_args() -> argparse.Namespace:
         "--no-log-features",
         action="store_true",
         help="关闭 log1p 数值特征扩展",
+    )
+    parser.add_argument(
+        "--region-prior-cols",
+        default="PROVINCE,CITY",
+        help=(
+            "区域层级先验特征使用的地区列，按层级从粗到细填写，逗号分隔。"
+            "默认：PROVINCE,CITY"
+        ),
+    )
+    parser.add_argument(
+        "--region-prior-smoothing",
+        type=float,
+        default=15.0,
+        help="区域层级先验的平滑强度，越大越保守，默认：15.0",
+    )
+    parser.add_argument(
+        "--no-region-priors",
+        action="store_true",
+        help="关闭区域层级先验特征",
     )
     parser.add_argument(
         "--trend-model",
@@ -369,11 +389,244 @@ def remove_identifier_columns(x: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
     return x.drop(columns=drop_cols), drop_cols
 
 
-def parse_feature_list(raw_text: str) -> list[str]:
+def parse_feature_list(
+    raw_text: str,
+    default_items: tuple[str, ...] | list[str] | None = None,
+) -> list[str]:
     """将逗号分隔的参数解析为列名列表。"""
+    if default_items is None:
+        default_items = DEFAULT_LOG_FEATURE_CANDIDATES
     if not raw_text.strip():
-        return list(DEFAULT_LOG_FEATURE_CANDIDATES)
+        return list(default_items)
     return [item.strip() for item in raw_text.split(",") if item.strip()]
+
+
+def normalize_region_key_series(series: pd.Series) -> pd.Series:
+    """将地区列统一整理为可分组统计的字符串键。"""
+    return series.fillna("__MISSING_REGION__").astype(str)
+
+
+def build_region_count_statistics(keys: pd.Series) -> pd.DataFrame:
+    """统计每个地区键在参考样本中的出现次数。"""
+    count_df = (
+        keys.value_counts(dropna=False)
+        .rename_axis("region_key")
+        .reset_index(name="count")
+    )
+    count_df["support_log1p"] = np.log1p(count_df["count"].astype(float))
+    return count_df
+
+
+def build_smoothed_region_prior_statistics(
+    keys: pd.Series,
+    values: pd.Series,
+    smoothing: float,
+) -> dict[str, Any]:
+    """
+    为某一层地区列构建平滑后的先验统计。
+
+    使用的是常见的平滑均值编码：
+    `prior = (group_sum + global_mean * smoothing) / (group_count + smoothing)`
+
+    这样做比直接使用组均值更稳，尤其适合 CITY 这类样本量不均衡的列。
+    """
+    value_series = pd.to_numeric(values, errors="coerce")
+    global_mean = float(value_series.mean())
+    stats_df = (
+        pd.DataFrame({"region_key": keys, "value": value_series})
+        .groupby("region_key", dropna=False)["value"]
+        .agg(["sum", "count"])
+        .reset_index()
+    )
+    stats_df["prior"] = (
+        stats_df["sum"] + global_mean * smoothing
+    ) / (stats_df["count"] + smoothing)
+    return {
+        "global_mean": global_mean,
+        "stats": stats_df[["region_key", "count", "prior"]].copy(),
+    }
+
+
+def build_region_prior_statistics_bundle(
+    x_reference: pd.DataFrame,
+    prior_targets: dict[str, pd.Series],
+    region_cols: list[str],
+    smoothing: float,
+) -> dict[str, Any]:
+    """
+    基于参考样本构建整套区域层级先验统计。
+
+    这里会同时产出三类信息：
+    1. 每层地区的样本量 support；
+    2. 目标值 target 的平滑地区均值；
+    3. 残差 residual 的平滑地区均值。
+    """
+    applicable_cols = [col for col in region_cols if col in x_reference.columns]
+    support_stats: dict[str, pd.DataFrame] = {}
+    prior_stats: dict[str, dict[str, Any]] = {name: {} for name in prior_targets}
+
+    for col in applicable_cols:
+        key_series = normalize_region_key_series(x_reference[col])
+        support_stats[col] = build_region_count_statistics(key_series)
+        for target_name, values in prior_targets.items():
+            prior_stats[target_name][col] = build_smoothed_region_prior_statistics(
+                keys=key_series,
+                values=values,
+                smoothing=smoothing,
+            )
+
+    return {
+        "region_cols": applicable_cols,
+        "smoothing": float(smoothing),
+        "support_stats": support_stats,
+        "prior_stats": prior_stats,
+    }
+
+
+def apply_region_prior_statistics(
+    x_apply: pd.DataFrame,
+    stats_bundle: dict[str, Any],
+) -> pd.DataFrame:
+    """
+    将区域层级先验统计映射到目标样本上，生成数值特征矩阵。
+
+    生成的特征包括：
+    1. 每层地区样本量的 `log1p` 支持度；
+    2. 每层地区的 target/residual 平滑先验；
+    3. 相邻层级之间的先验差值，例如 `CITY - PROVINCE`。
+    """
+    region_cols: list[str] = stats_bundle["region_cols"]
+    support_stats: dict[str, pd.DataFrame] = stats_bundle["support_stats"]
+    prior_stats: dict[str, dict[str, Any]] = stats_bundle["prior_stats"]
+    feature_df = pd.DataFrame(index=x_apply.index)
+
+    for level_idx, col in enumerate(region_cols):
+        apply_keys = normalize_region_key_series(x_apply[col])
+
+        support_map = support_stats[col].set_index("region_key")["support_log1p"]
+        support_feature_name = f"__region_support_log1p__{col}"
+        feature_df[support_feature_name] = (
+            apply_keys.map(support_map).fillna(0.0).astype(float)
+        )
+
+        for target_name, col_stats_map in prior_stats.items():
+            target_stats = col_stats_map[col]
+            prior_map = target_stats["stats"].set_index("region_key")["prior"]
+            prior_feature_name = f"__region_{target_name}_prior__{col}"
+            feature_df[prior_feature_name] = (
+                apply_keys.map(prior_map)
+                .fillna(target_stats["global_mean"])
+                .astype(float)
+            )
+
+            if level_idx > 0:
+                parent_col = region_cols[level_idx - 1]
+                parent_feature_name = f"__region_{target_name}_prior__{parent_col}"
+                delta_feature_name = (
+                    f"__region_{target_name}_delta__{col}_minus_{parent_col}"
+                )
+                feature_df[delta_feature_name] = (
+                    feature_df[prior_feature_name] - feature_df[parent_feature_name]
+                )
+
+    return feature_df
+
+
+def generate_region_prior_features(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    residual_train_oof: pd.Series,
+    groups_train: pd.Series | None,
+    cv_folds: int,
+    random_state: int,
+    validation_mode: str,
+    region_cols: list[str],
+    smoothing: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """
+    为训练集和测试集生成“无泄漏”的区域层级先验特征。
+
+    训练集：
+    - 使用 OOF 方式生成，每条样本的地区先验都来自“未见过该样本的参考子集”。
+
+    测试集：
+    - 使用完整训练集统计得到地区先验，模拟真实部署场景。
+    """
+    applicable_cols = [col for col in region_cols if col in x_train.columns]
+    skipped_cols = [col for col in region_cols if col not in x_train.columns]
+    if not applicable_cols:
+        empty_train = pd.DataFrame(index=x_train.index)
+        empty_test = pd.DataFrame(index=x_test.index)
+        return empty_train, empty_test, {
+            "enabled": False,
+            "region_cols": [],
+            "skipped_cols": skipped_cols,
+            "smoothing": float(smoothing),
+            "feature_names": [],
+            "full_statistics": None,
+        }
+
+    split_indices = build_cv_split_indices(
+        x_data=x_train,
+        y_data=y_train,
+        groups_data=groups_train,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        validation_mode=validation_mode,
+        stage_name="区域层级先验 OOF",
+    )
+
+    oof_feature_df: pd.DataFrame | None = None
+    for fold_no, (tr_idx, val_idx) in enumerate(split_indices, start=1):
+        fold_bundle = build_region_prior_statistics_bundle(
+            x_reference=x_train.iloc[tr_idx],
+            prior_targets={
+                "target": y_train.iloc[tr_idx],
+                "residual": residual_train_oof.iloc[tr_idx],
+            },
+            region_cols=applicable_cols,
+            smoothing=smoothing,
+        )
+        fold_feature_df = apply_region_prior_statistics(
+            x_apply=x_train.iloc[val_idx],
+            stats_bundle=fold_bundle,
+        )
+        if oof_feature_df is None:
+            oof_feature_df = pd.DataFrame(
+                index=x_train.index,
+                columns=fold_feature_df.columns,
+                dtype=float,
+            )
+        oof_feature_df.iloc[val_idx] = fold_feature_df.to_numpy()
+        print(
+            f"[区域先验 OOF] fold {fold_no}/{cv_folds} "
+            f"生成 {fold_feature_df.shape[1]} 个特征"
+        )
+
+    if oof_feature_df is None:
+        oof_feature_df = pd.DataFrame(index=x_train.index)
+
+    full_bundle = build_region_prior_statistics_bundle(
+        x_reference=x_train,
+        prior_targets={"target": y_train, "residual": residual_train_oof},
+        region_cols=applicable_cols,
+        smoothing=smoothing,
+    )
+    test_feature_df = apply_region_prior_statistics(
+        x_apply=x_test,
+        stats_bundle=full_bundle,
+    )
+    oof_feature_df = oof_feature_df.reindex(columns=test_feature_df.columns).astype(float)
+
+    return oof_feature_df, test_feature_df, {
+        "enabled": True,
+        "region_cols": applicable_cols,
+        "skipped_cols": skipped_cols,
+        "smoothing": float(smoothing),
+        "feature_names": test_feature_df.columns.tolist(),
+        "full_statistics": full_bundle,
+    }
 
 
 def resolve_xgb_feature_view(
@@ -1093,6 +1346,19 @@ def make_augmented_features(x: pd.DataFrame, trend_pred: np.ndarray) -> pd.DataF
     x_aug = x.copy()
     x_aug[TREND_FEATURE_NAME] = trend_pred
     return x_aug
+
+
+def append_region_prior_features(
+    x_base: pd.DataFrame,
+    prior_feature_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """将区域层级先验特征按列拼接回基础特征表。"""
+    if prior_feature_df.empty:
+        return x_base.copy()
+    return pd.concat(
+        [x_base.reset_index(drop=True), prior_feature_df.reset_index(drop=True)],
+        axis=1,
+    )
 
 
 def generate_oof_trend_predictions(
@@ -1831,6 +2097,7 @@ def save_artifact(
     validation_mode: str,
     group_col: str,
     log_feature_cols: list[str],
+    region_prior_config: dict[str, Any] | None,
     sample_weight_config: dict[str, float] | None,
     high_pm25_eval_config: dict[str, float] | None,
 ) -> None:
@@ -1866,6 +2133,7 @@ def save_artifact(
         "split_strategy": split_strategy,
         "trend_model_name": describe_trend_model(trend_model),
         "log_feature_cols": log_feature_cols,
+        "region_prior_config": region_prior_config,
         "sample_weight_config": sample_weight_config,
         "high_pm25_eval_config": high_pm25_eval_config,
         "model_type": f"linear_trend_plus_{residual_model_mode}_residual",
@@ -2009,6 +2277,55 @@ def main() -> None:
     # 因此这里保留 OOF 残差作为最终训练目标，让残差模型学习更真实、更可泛化的偏差。
     x_train_aug_for_fit = x_train_aug_for_tune.copy()
     x_test_aug = make_augmented_features(x_test, trend_test_pred)
+
+    region_prior_config: dict[str, Any] | None = None
+    if args.no_region_priors:
+        print("[信息] 已关闭区域层级先验特征。")
+    else:
+        region_prior_cols = parse_feature_list(
+            args.region_prior_cols,
+            DEFAULT_REGION_PRIOR_COLS,
+        )
+        region_train_prior_df, region_test_prior_df, region_prior_config = (
+            generate_region_prior_features(
+                x_train=x_train,
+                x_test=x_test,
+                y_train=y_train,
+                residual_train_oof=residual_train_oof,
+                groups_train=groups_train,
+                cv_folds=args.residual_cv_folds,
+                random_state=args.random_state,
+                validation_mode=args.validation_mode,
+                region_cols=region_prior_cols,
+                smoothing=args.region_prior_smoothing,
+            )
+        )
+        if region_prior_config["enabled"]:
+            x_train_aug_for_tune = append_region_prior_features(
+                x_train_aug_for_tune,
+                region_train_prior_df,
+            )
+            x_train_aug_for_fit = append_region_prior_features(
+                x_train_aug_for_fit,
+                region_train_prior_df,
+            )
+            x_test_aug = append_region_prior_features(
+                x_test_aug,
+                region_test_prior_df,
+            )
+            print(
+                "[信息] 已启用区域层级先验特征："
+                f"cols={region_prior_config['region_cols']}, "
+                f"smoothing={region_prior_config['smoothing']:.2f}, "
+                f"features={len(region_prior_config['feature_names'])}"
+            )
+            if region_prior_config["skipped_cols"]:
+                print(
+                    "[信息] 区域层级先验已跳过缺失列："
+                    f"{region_prior_config['skipped_cols']}"
+                )
+        else:
+            print("[信息] 未生成区域层级先验特征：未找到可用地区列。")
 
     xgb_feature_view_requested = args.xgb_feature_view
     xgb_complementary_drop_cols = parse_feature_list(args.xgb_complementary_drop_cols)
@@ -2441,6 +2758,7 @@ def main() -> None:
             validation_mode=args.validation_mode,
             group_col=args.group_col,
             log_feature_cols=added_log_cols,
+            region_prior_config=region_prior_config,
             sample_weight_config=sample_weight_config,
             high_pm25_eval_config=high_pm25_eval_config,
         )

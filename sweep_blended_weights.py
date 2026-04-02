@@ -31,7 +31,9 @@ except ImportError as exc:
     ) from exc
 
 from train_pm25_trend_residual_xgboost import (
+    DEFAULT_REGION_PRIOR_COLS,
     add_log_transformed_features,
+    append_region_prior_features,
     build_high_pm25_eval_config,
     build_residual_pipeline,
     build_sample_weight_config,
@@ -44,6 +46,7 @@ from train_pm25_trend_residual_xgboost import (
     fit_final_catboost_residual_model,
     fit_final_residual_model,
     fit_final_trend_model,
+    generate_region_prior_features,
     generate_oof_catboost_residual_predictions,
     generate_oof_trend_predictions,
     generate_oof_xgboost_residual_predictions,
@@ -168,6 +171,22 @@ def parse_args() -> argparse.Namespace:
         "--no-log-features",
         action="store_true",
         help="关闭 log1p 数值特征扩展",
+    )
+    parser.add_argument(
+        "--region-prior-cols",
+        default="PROVINCE,CITY",
+        help="区域层级先验特征使用的地区列，按层级从粗到细填写，默认：PROVINCE,CITY",
+    )
+    parser.add_argument(
+        "--region-prior-smoothing",
+        type=float,
+        default=15.0,
+        help="区域层级先验的平滑强度，默认：15.0",
+    )
+    parser.add_argument(
+        "--no-region-priors",
+        action="store_true",
+        help="关闭区域层级先验特征",
     )
     parser.add_argument(
         "--keep-id-cols",
@@ -442,6 +461,48 @@ def main() -> None:
     x_train_aug_for_tune = make_augmented_features(x_train, trend_train_oof_pred)
     x_train_aug_for_fit = x_train_aug_for_tune.copy()
     x_test_aug = make_augmented_features(x_test, trend_test_pred)
+    if args.no_region_priors:
+        print("[信息] 已关闭区域层级先验特征。")
+    else:
+        region_prior_cols = parse_feature_list(
+            args.region_prior_cols,
+            DEFAULT_REGION_PRIOR_COLS,
+        )
+        region_train_prior_df, region_test_prior_df, region_prior_config = (
+            generate_region_prior_features(
+                x_train=x_train,
+                x_test=x_test,
+                y_train=y_train,
+                residual_train_oof=residual_train_oof,
+                groups_train=groups_train,
+                cv_folds=args.residual_cv_folds,
+                random_state=args.random_state,
+                validation_mode=args.validation_mode,
+                region_cols=region_prior_cols,
+                smoothing=args.region_prior_smoothing,
+            )
+        )
+        if region_prior_config["enabled"]:
+            x_train_aug_for_tune = append_region_prior_features(
+                x_train_aug_for_tune,
+                region_train_prior_df,
+            )
+            x_train_aug_for_fit = append_region_prior_features(
+                x_train_aug_for_fit,
+                region_train_prior_df,
+            )
+            x_test_aug = append_region_prior_features(
+                x_test_aug,
+                region_test_prior_df,
+            )
+            print(
+                "[信息] 已启用区域层级先验特征："
+                f"cols={region_prior_config['region_cols']}, "
+                f"smoothing={region_prior_config['smoothing']:.2f}, "
+                f"features={len(region_prior_config['feature_names'])}"
+            )
+        else:
+            print("[信息] 未生成区域层级先验特征：未找到可用地区列。")
     xgb_train_aug_for_tune, xgb_feature_view_info = prepare_xgb_residual_features(
         x=x_train_aug_for_tune,
         residual_model="ensemble",
