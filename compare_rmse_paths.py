@@ -192,6 +192,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="关闭区域层级先验特征",
     )
+    parser.add_argument(
+        "--county-col",
+        default="COUNTY",
+        help="需要做消融实验的县级列名，默认：COUNTY",
+    )
+    parser.add_argument(
+        "--county-ablation-modes",
+        default="keep",
+        help=(
+            "COUNTY 消融模式，逗号分隔。支持：keep, drop。"
+            "例如：keep,drop。默认：keep"
+        ),
+    )
     parser.add_argument("--keep-id-cols", action="store_true", help="保留疑似 ID 列")
     parser.add_argument(
         "--xgb-complementary-drop-cols",
@@ -341,6 +354,66 @@ def parse_region_prior_setting_candidates(
     return candidates
 
 
+def parse_county_ablation_candidates(
+    raw_text: str,
+) -> list[dict[str, Any]]:
+    """解析 COUNTY 消融实验配置。"""
+    candidates: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    raw_items = [item.strip() for item in raw_text.split(",") if item.strip()]
+    if not raw_items:
+        raw_items = ["keep"]
+
+    for item in raw_items:
+        item_lower = item.lower()
+        if item_lower in {"keep", "on", "full"}:
+            label = "keep"
+            drop_county = False
+        elif item_lower in {"drop", "drop_county", "no_county", "off"}:
+            label = "drop"
+            drop_county = True
+        else:
+            raise ValueError(
+                "county-ablation-modes 只支持 keep 和 drop。"
+            )
+
+        if label not in seen_labels:
+            candidates.append(
+                {
+                    "label": label,
+                    "drop_county": drop_county,
+                }
+            )
+            seen_labels.add(label)
+
+    return candidates
+
+
+def apply_county_ablation(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    county_col: str,
+    county_setting: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """根据设定保留或移除 COUNTY 列。"""
+    x_train_new = x_train.copy()
+    x_test_new = x_test.copy()
+    removed_cols: list[str] = []
+
+    if county_setting["drop_county"] and county_col in x_train_new.columns:
+        x_train_new = x_train_new.drop(columns=[county_col])
+        if county_col in x_test_new.columns:
+            x_test_new = x_test_new.drop(columns=[county_col])
+        removed_cols.append(county_col)
+
+    return x_train_new, x_test_new, {
+        "label": county_setting["label"],
+        "drop_county": bool(county_setting["drop_county"]),
+        "county_col": county_col,
+        "removed_cols": removed_cols,
+    }
+
+
 def build_result_row(
     path_name: str,
     path_type: str,
@@ -353,6 +426,8 @@ def build_result_row(
     region_prior_enabled: bool,
     region_prior_smoothing: float | None,
     region_prior_label: str,
+    county_ablation_label: str,
+    county_removed_cols: list[str],
 ) -> dict[str, Any]:
     metrics = calculate_metrics(y_test, final_test_pred)
     high_metrics, high_count = calculate_high_pm25_metrics(
@@ -370,6 +445,8 @@ def build_result_row(
         "weight_strategy": ensemble_config.get("strategy", ""),
         "objective_metric": ensemble_config.get("objective_metric", ""),
         "objective_score": ensemble_config.get("objective_score"),
+        "county_ablation_label": county_ablation_label,
+        "county_removed_cols": ",".join(county_removed_cols),
         "region_prior_enabled": bool(region_prior_enabled),
         "region_prior_smoothing": region_prior_smoothing,
         "region_prior_label": region_prior_label,
@@ -385,6 +462,10 @@ def build_result_row(
 
 def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> None:
     """绘制各建模路径在整体 RMSE 与高污染子集 RMSE 上的对比图。"""
+    has_multiple_county_modes = (
+        "county_ablation_label" in results_df.columns
+        and results_df["county_ablation_label"].nunique() > 1
+    )
     has_multiple_region_settings = (
         "region_prior_label" in results_df.columns
         and results_df["region_prior_label"].nunique() > 1
@@ -393,19 +474,33 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
         plot_df = results_df.assign(
             region_prior_smoothing_sort=results_df["region_prior_smoothing"].fillna(-1.0)
         ).sort_values(
-            ["path_name", "region_prior_enabled", "region_prior_smoothing_sort"]
+            [
+                "path_name",
+                "county_ablation_label",
+                "region_prior_enabled",
+                "region_prior_smoothing_sort",
+            ]
         ).reset_index(drop=True)
-        labels = [
-            f"{path_name}\n[{region_label}]"
-            for path_name, region_label in zip(
-                plot_df["path_name"], plot_df["region_prior_label"]
-            )
-        ]
+        labels = []
+        for _, row in plot_df.iterrows():
+            suffix_parts: list[str] = []
+            if has_multiple_county_modes:
+                suffix_parts.append(f"county={row['county_ablation_label']}")
+            suffix_parts.append(f"region={row['region_prior_label']}")
+            labels.append(f"{row['path_name']}\n[" + ", ".join(suffix_parts) + "]")
     else:
         plot_df = results_df.sort_values(
-            ["test_rmse", "high_pm25_rmse", "path_name"]
+            ["test_rmse", "high_pm25_rmse", "path_name", "county_ablation_label"]
         ).reset_index(drop=True)
-        labels = plot_df["path_name"].tolist()
+        if has_multiple_county_modes:
+            labels = [
+                f"{path_name}\n[county={county_label}]"
+                for path_name, county_label in zip(
+                    plot_df["path_name"], plot_df["county_ablation_label"]
+                )
+            ]
+        else:
+            labels = plot_df["path_name"].tolist()
 
     x_positions = list(range(len(plot_df)))
     test_rmse = plot_df["test_rmse"].tolist()
@@ -430,8 +525,8 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
     )
     axes[0].set_title(
         "RMSE by Modeling Path"
-        if not has_multiple_region_settings
-        else "RMSE by Modeling Path and Region Prior Setting"
+        if not has_multiple_region_settings and not has_multiple_county_modes
+        else "RMSE by Path / County Ablation / Region Prior"
     )
     axes[0].set_ylabel("RMSE")
     axes[0].set_xticks(x_positions)
@@ -445,8 +540,8 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
     axes[1].axhline(0.0, color="#595959", linewidth=1.0)
     axes[1].set_title(
         "High-PM2.5 vs Overall RMSE Gap"
-        if not has_multiple_region_settings
-        else "RMSE Gap by Region Prior Setting"
+        if not has_multiple_region_settings and not has_multiple_county_modes
+        else "RMSE Gap by County Ablation / Region Prior"
     )
     axes[1].set_ylabel("High-PM2.5 RMSE - Overall RMSE")
     axes[1].set_xticks(x_positions)
@@ -600,6 +695,7 @@ def evaluate_paths_for_region_prior_setting(
     residual_sample_weight,
     high_pm25_eval_config: dict[str, float],
     region_prior_setting: dict[str, Any],
+    county_setting_info: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """在给定区域先验配置下，训练并评估多条建模路径。"""
     region_prior_label = str(region_prior_setting["label"])
@@ -798,6 +894,8 @@ def evaluate_paths_for_region_prior_setting(
                     region_prior_enabled=bool(region_prior_setting["enabled"]),
                     region_prior_smoothing=region_prior_setting["smoothing"],
                     region_prior_label=region_prior_label,
+                    county_ablation_label=county_setting_info["label"],
+                    county_removed_cols=county_setting_info["removed_cols"],
                 )
             )
         elif path_name == "xgb_complementary":
@@ -820,6 +918,8 @@ def evaluate_paths_for_region_prior_setting(
                     region_prior_enabled=bool(region_prior_setting["enabled"]),
                     region_prior_smoothing=region_prior_setting["smoothing"],
                     region_prior_label=region_prior_label,
+                    county_ablation_label=county_setting_info["label"],
+                    county_removed_cols=county_setting_info["removed_cols"],
                 )
             )
         elif path_name == "catboost":
@@ -843,6 +943,8 @@ def evaluate_paths_for_region_prior_setting(
                     region_prior_enabled=bool(region_prior_setting["enabled"]),
                     region_prior_smoothing=region_prior_setting["smoothing"],
                     region_prior_label=region_prior_label,
+                    county_ablation_label=county_setting_info["label"],
+                    county_removed_cols=county_setting_info["removed_cols"],
                 )
             )
         elif path_name.startswith("ensemble_"):
@@ -887,6 +989,8 @@ def evaluate_paths_for_region_prior_setting(
                     region_prior_enabled=bool(region_prior_setting["enabled"]),
                     region_prior_smoothing=region_prior_setting["smoothing"],
                     region_prior_label=region_prior_label,
+                    county_ablation_label=county_setting_info["label"],
+                    county_removed_cols=county_setting_info["removed_cols"],
                 )
             )
         else:
@@ -901,6 +1005,9 @@ def main() -> None:
     out_path = resolve_output_path(args.out, run_name)
     plot_path = resolve_plot_path(args.plot_out, run_name)
     path_candidates = parse_path_candidates(args.paths)
+    county_ablation_settings = parse_county_ablation_candidates(
+        args.county_ablation_modes
+    )
     region_prior_settings = parse_region_prior_setting_candidates(
         raw_text=args.region_prior_smoothing_values,
         default_smoothing=args.region_prior_smoothing,
@@ -952,6 +1059,10 @@ def main() -> None:
     print(f"[信息] 当前验证方式：{args.validation_mode}")
     print(f"[信息] 当前比较路径：{path_candidates}")
     print(
+        "[信息] 当前 COUNTY 消融设置："
+        f"{[setting['label'] for setting in county_ablation_settings]}"
+    )
+    print(
         "[信息] 当前区域层级先验设置："
         f"{[setting['label'] for setting in region_prior_settings]}"
     )
@@ -977,45 +1088,62 @@ def main() -> None:
         f"threshold={high_pm25_eval_config['threshold']:.4f}"
     )
 
-    print(f"[信息] 开始生成线性趋势 OOF 预测：trend_cv_folds={args.trend_cv_folds}")
-    trend_train_oof_pred = generate_oof_trend_predictions(
-        x_train=x_train,
-        y_train=y_train,
-        groups_train=groups_train,
-        cv_folds=args.trend_cv_folds,
-        random_state=args.random_state,
-        validation_mode=args.validation_mode,
-        trend_model=args.trend_model,
-        weight_config=sample_weight_config,
-    )
-    trend_model = fit_final_trend_model(
-        x_train=x_train,
-        y_train=y_train,
-        trend_model=args.trend_model,
-        sample_weight=trend_sample_weight,
-    )
-    trend_test_pred = trend_model.predict(x_test)
-    residual_train_oof = y_train - trend_train_oof_pred
     path_results: list[dict[str, Any]] = []
-    for region_setting in region_prior_settings:
+    for county_setting in county_ablation_settings:
         print("\n" + "=" * 72)
-        path_results.extend(
-            evaluate_paths_for_region_prior_setting(
-                args=args,
-                path_candidates=path_candidates,
-                x_train=x_train,
-                x_test=x_test,
-                y_train=y_train,
-                y_test=y_test,
-                groups_train=groups_train,
-                trend_train_oof_pred=trend_train_oof_pred,
-                trend_test_pred=trend_test_pred,
-                residual_train_oof=residual_train_oof,
-                residual_sample_weight=residual_sample_weight,
-                high_pm25_eval_config=high_pm25_eval_config,
-                region_prior_setting=region_setting,
-            )
+        x_train_mode, x_test_mode, county_setting_info = apply_county_ablation(
+            x_train=x_train,
+            x_test=x_test,
+            county_col=args.county_col,
+            county_setting=county_setting,
         )
+        print(
+            "[信息] 当前 COUNTY 消融模式："
+            f"{county_setting_info['label']}, "
+            f"removed_cols={county_setting_info['removed_cols']}"
+        )
+        print(
+            f"[信息] 开始生成线性趋势 OOF 预测：trend_cv_folds={args.trend_cv_folds}"
+        )
+        trend_train_oof_pred = generate_oof_trend_predictions(
+            x_train=x_train_mode,
+            y_train=y_train,
+            groups_train=groups_train,
+            cv_folds=args.trend_cv_folds,
+            random_state=args.random_state,
+            validation_mode=args.validation_mode,
+            trend_model=args.trend_model,
+            weight_config=sample_weight_config,
+        )
+        trend_model = fit_final_trend_model(
+            x_train=x_train_mode,
+            y_train=y_train,
+            trend_model=args.trend_model,
+            sample_weight=trend_sample_weight,
+        )
+        trend_test_pred = trend_model.predict(x_test_mode)
+        residual_train_oof = y_train - trend_train_oof_pred
+
+        for region_setting in region_prior_settings:
+            print("\n" + "-" * 72)
+            path_results.extend(
+                evaluate_paths_for_region_prior_setting(
+                    args=args,
+                    path_candidates=path_candidates,
+                    x_train=x_train_mode,
+                    x_test=x_test_mode,
+                    y_train=y_train,
+                    y_test=y_test,
+                    groups_train=groups_train,
+                    trend_train_oof_pred=trend_train_oof_pred,
+                    trend_test_pred=trend_test_pred,
+                    residual_train_oof=residual_train_oof,
+                    residual_sample_weight=residual_sample_weight,
+                    high_pm25_eval_config=high_pm25_eval_config,
+                    region_prior_setting=region_setting,
+                    county_setting_info=county_setting_info,
+                )
+            )
 
     results_df = pd.DataFrame(path_results)
     results_df["test_rmse_rank"] = results_df["test_rmse"].rank(method="min")
@@ -1037,6 +1165,7 @@ def main() -> None:
         ).sort_values(
             [
                 "path_name",
+                "county_ablation_label",
                 "test_rmse",
                 "high_pm25_rmse",
                 "region_prior_enabled",
@@ -1056,6 +1185,7 @@ def main() -> None:
     print("\n=== 路径对比结果（按 test_rmse 排序） ===")
     display_cols = [
         "path_name",
+        "county_ablation_label",
         "region_prior_label",
         "region_prior_smoothing",
         "path_type",
