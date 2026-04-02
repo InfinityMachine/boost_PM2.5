@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -257,27 +258,52 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-plot", action="store_true", help="不绘制并保存诊断图")
     parser.add_argument("--no-save", action="store_true", help="不保存训练好的模型")
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "实验运行名称。若不指定，将自动生成带时间戳的目录名，"
+            "并用于组织 .diag/ 与 cache/ 下的默认输出"
+        ),
+    )
     return parser.parse_args()
+
+
+def sanitize_run_name(run_name: str) -> str:
+    """将运行名称整理成适合目录名的形式。"""
+    sanitized = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in run_name.strip()
+    ).strip("_")
+    return sanitized or "run"
+
+
+def build_default_run_name(prefix: str, run_name: str | None) -> str:
+    """生成默认实验目录名。"""
+    if run_name:
+        return sanitize_run_name(run_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{sanitize_run_name(prefix)}_{timestamp}"
 
 
 def resolve_output_paths(
     residual_model: str,
     model_out_arg: str | None,
     plot_out_arg: str | None,
+    run_name: str,
 ) -> tuple[Path, Path]:
     """根据残差模型类型自动决定输出文件名。"""
     default_outputs = {
         "xgboost": (
-            "cache/pm25_trend_residual_xgboost.joblib",
-            ".diag/pm25_trend_residual_xgboost_diagnostics.png",
+            f"cache/{run_name}/pm25_trend_residual_xgboost.joblib",
+            f".diag/{run_name}/pm25_trend_residual_xgboost_diagnostics.png",
         ),
         "catboost": (
-            "cache/pm25_trend_residual_catboost.joblib",
-            ".diag/pm25_trend_residual_catboost_diagnostics.png",
+            f"cache/{run_name}/pm25_trend_residual_catboost.joblib",
+            f".diag/{run_name}/pm25_trend_residual_catboost_diagnostics.png",
         ),
         "ensemble": (
-            "cache/pm25_trend_residual_ensemble.joblib",
-            ".diag/pm25_trend_residual_ensemble_diagnostics.png",
+            f"cache/{run_name}/pm25_trend_residual_ensemble.joblib",
+            f".diag/{run_name}/pm25_trend_residual_ensemble_diagnostics.png",
         ),
     }
     default_model_out, default_plot_out = default_outputs[residual_model]
@@ -1828,11 +1854,16 @@ def main() -> None:
     """主流程：读取数据 -> 线性趋势 -> 残差模型 -> 评估 -> 保存。"""
     args = parse_args()
 
+    run_name = build_default_run_name(
+        prefix=f"trend_residual_{args.residual_model}",
+        run_name=args.run_name,
+    )
     data_path = Path(args.data)
     model_out, plot_out = resolve_output_paths(
         residual_model=args.residual_model,
         model_out_arg=args.model_out,
         plot_out_arg=args.plot_out,
+        run_name=run_name,
     )
 
     # 1) 读取并清洗数据
@@ -1885,6 +1916,7 @@ def main() -> None:
     print(f"[信息] 当前训练设备：{args.device.upper()}")
     if args.device == "gpu":
         print(f"[信息] 使用 GPU 编号：{args.gpu_id}")
+    print(f"[信息] 当前运行目录：{run_name}")
     print(f"[信息] 当前趋势模型：{args.trend_model}")
     print(f"[信息] 当前残差模型：{args.residual_model}")
     print(f"[信息] 当前验证方式：{args.validation_mode}")

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -214,10 +215,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--out",
-        default=".diag/pm25_blended_weight_sweep.csv",
-        help="实验结果输出 CSV 路径，默认：.diag/pm25_blended_weight_sweep.csv",
+        default=None,
+        help="实验结果输出 CSV 路径；若不指定，将自动保存到 .diag/<run-name>/ 下",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "实验运行名称。若不指定，将自动生成带时间戳的目录名，"
+            "并用于组织 .diag/ 下的扫描结果"
+        ),
     )
     return parser.parse_args()
+
+
+def sanitize_run_name(run_name: str) -> str:
+    """将运行名称整理成适合目录名的形式。"""
+    sanitized = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in run_name.strip()
+    ).strip("_")
+    return sanitized or "run"
+
+
+def build_default_run_name(prefix: str, run_name: str | None) -> str:
+    """生成默认实验目录名。"""
+    if run_name:
+        return sanitize_run_name(run_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{sanitize_run_name(prefix)}_{timestamp}"
+
+
+def resolve_output_path(out_arg: str | None, run_name: str) -> Path:
+    """解析实验结果 CSV 的默认输出路径。"""
+    if out_arg:
+        return Path(out_arg)
+    return Path(f".diag/{run_name}/pm25_blended_weight_sweep.csv")
 
 
 def parse_weight_candidates(raw_text: str) -> list[float]:
@@ -290,7 +322,11 @@ def main() -> None:
     """主流程：训练一次，扫描多组 blended 权重，输出对比表。"""
     args = parse_args()
     weight_candidates = parse_weight_candidates(args.weights)
-    out_path = Path(args.out)
+    run_name = build_default_run_name(
+        prefix="sweep_blended_weights",
+        run_name=args.run_name,
+    )
+    out_path = resolve_output_path(args.out, run_name)
 
     # 1) 读取与基础特征清洗
     x, y = load_data(Path(args.data), args.target)
@@ -338,6 +374,7 @@ def main() -> None:
         )
 
     print(f"[信息] 当前训练设备：{args.device.upper()}")
+    print(f"[信息] 当前运行目录：{run_name}")
     print(f"[信息] 当前趋势模型：{args.trend_model}")
     print(f"[信息] 当前验证方式：{args.validation_mode}")
     print(f"[信息] blended 权重候选：{weight_candidates}")
