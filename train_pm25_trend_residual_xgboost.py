@@ -63,6 +63,23 @@ TREND_FEATURE_NAME = "__linear_trend_pred__"
 DEFAULT_RIDGE_ALPHAS = np.logspace(-3, 3, 13)
 DEFAULT_LOG_FEATURE_CANDIDATES = ("NOX", "SO2", "fertilzier", "manure")
 DEFAULT_XGB_COMPLEMENTARY_DROP_COLS = ("CITY", "COUNTY")
+DEFAULT_XGB_ALL_INTERACTION_RULES = (
+    ("NOX_x_SO2", "mul", ("NOX", "SO2")),
+    ("NOX_x_wind", "mul", ("NOX", "wind")),
+    ("tem_x_ppt", "mul", ("tem", "ppt")),
+    ("fertilzier_plus_manure", "add", ("fertilzier", "manure")),
+    ("NOX_div_wind", "div", ("NOX", "wind")),
+)
+DEFAULT_XGB_COMPLEMENTARY_INTERACTION_RULES = (
+    ("NOX_x_SO2", "mul", ("NOX", "SO2")),
+    ("NOX_x_wind", "mul", ("NOX", "wind")),
+    ("SO2_x_wind", "mul", ("SO2", "wind")),
+    ("tem_x_ppt", "mul", ("tem", "ppt")),
+    ("AET_x_ppt", "mul", ("AET", "ppt")),
+    ("fertilzier_plus_manure", "add", ("fertilzier", "manure")),
+    ("NOX_div_wind", "div", ("NOX", "wind")),
+    ("SO2_div_wind", "div", ("SO2", "wind")),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +174,11 @@ def parse_args() -> argparse.Namespace:
         "--no-xgb-complementary-interactions",
         action="store_true",
         help="关闭 XGBoost complementary 视图下的默认数值交互特征",
+    )
+    parser.add_argument(
+        "--no-xgb-all-interactions",
+        action="store_true",
+        help="关闭 XGBoost all 视图下的默认精选交互特征",
     )
     parser.add_argument(
         "--ensemble-weight-xgb",
@@ -373,13 +395,13 @@ def resolve_xgb_feature_view(
 
 def build_xgb_interaction_features(
     x: pd.DataFrame,
+    interaction_rules: tuple[tuple[str, str, tuple[str, str]], ...],
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     """
-    为 XGBoost 的 complementary 视图构建一组数值交互特征。
+    为 XGBoost 构建一组数值交互特征。
 
-    这些特征的目标不是让模型“更复杂”本身，
-    而是有意引导 XGBoost 更专注于连续变量之间的局部非线性关系。
-    CatBoost 仍然负责完整的地区类别结构与类别交互。
+    这里把交互特征构建逻辑单独抽成通用函数，
+    方便在 `all` 与 `complementary` 两种视图下复用不同的规则集合。
     """
     x_new = x.copy()
     added_cols: list[str] = []
@@ -389,17 +411,6 @@ def build_xgb_interaction_features(
         if col not in x_new.columns:
             return None
         return pd.to_numeric(x_new[col], errors="coerce")
-
-    interaction_rules = [
-        ("NOX_x_SO2", "mul", ("NOX", "SO2")),
-        ("NOX_x_wind", "mul", ("NOX", "wind")),
-        ("SO2_x_wind", "mul", ("SO2", "wind")),
-        ("tem_x_ppt", "mul", ("tem", "ppt")),
-        ("AET_x_ppt", "mul", ("AET", "ppt")),
-        ("fertilzier_plus_manure", "add", ("fertilzier", "manure")),
-        ("NOX_div_wind", "div", ("NOX", "wind")),
-        ("SO2_div_wind", "div", ("SO2", "wind")),
-    ]
 
     for new_col, op_name, source_cols in interaction_rules:
         left = get_numeric_series(source_cols[0])
@@ -430,6 +441,7 @@ def prepare_xgb_residual_features(
     residual_model: str,
     xgb_feature_view: str,
     complementary_drop_cols: list[str],
+    add_all_interactions: bool,
     add_complementary_interactions: bool,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
@@ -437,6 +449,8 @@ def prepare_xgb_residual_features(
 
     `all` 视图：
     - 保留当前所有特征，适合单独把 XGBoost 当成主力模型。
+    - 默认额外补一小组精选交互特征，重点增强整体 RMSE 优化时常见的
+      数值耦合关系表达能力，但不会像 complementary 那样刻意削弱类别结构。
 
     `complementary` 视图：
     - 默认移除高基数地区列，例如 CITY / COUNTY；
@@ -450,7 +464,15 @@ def prepare_xgb_residual_features(
     added_interaction_cols: list[str] = []
     skipped_interaction_rules: list[str] = []
 
-    if effective_view == "complementary":
+    if effective_view == "all":
+        if add_all_interactions:
+            x_new, added_interaction_cols, skipped_interaction_rules = (
+                build_xgb_interaction_features(
+                    x_new,
+                    DEFAULT_XGB_ALL_INTERACTION_RULES,
+                )
+            )
+    elif effective_view == "complementary":
         drop_cols = [col for col in complementary_drop_cols if col in x_new.columns]
         if drop_cols:
             x_new = x_new.drop(columns=drop_cols)
@@ -458,7 +480,10 @@ def prepare_xgb_residual_features(
 
         if add_complementary_interactions:
             x_new, added_interaction_cols, skipped_interaction_rules = (
-                build_xgb_interaction_features(x_new)
+                build_xgb_interaction_features(
+                    x_new,
+                    DEFAULT_XGB_COMPLEMENTARY_INTERACTION_RULES,
+                )
             )
 
     info = {
@@ -502,15 +527,15 @@ def default_xgb_residual_params(
     else:
         model_kwargs = {
             "objective": "reg:squarederror",
-            "n_estimators": 600,
-            "learning_rate": 0.05,
-            "max_depth": 5,
-            "min_child_weight": 3,
-            "subsample": 0.85,
-            "colsample_bytree": 0.85,
+            "n_estimators": 900,
+            "learning_rate": 0.04,
+            "max_depth": 6,
+            "min_child_weight": 2,
+            "subsample": 0.9,
+            "colsample_bytree": 0.9,
             "gamma": 0.0,
             "reg_alpha": 0.0,
-            "reg_lambda": 1.0,
+            "reg_lambda": 1.5,
             "random_state": random_state,
         }
 
@@ -561,15 +586,15 @@ def default_xgb_param_distributions(
         }
 
     return {
-        "model__n_estimators": [300, 500, 700, 900],
-        "model__learning_rate": [0.02, 0.03, 0.05, 0.08],
-        "model__max_depth": [3, 4, 5, 6, 8],
-        "model__min_child_weight": [1, 2, 3, 5, 8],
-        "model__subsample": [0.7, 0.8, 0.85, 0.9, 1.0],
-        "model__colsample_bytree": [0.7, 0.8, 0.85, 0.9, 1.0],
-        "model__gamma": [0.0, 0.1, 0.2, 0.5],
-        "model__reg_alpha": [0.0, 0.01, 0.1, 1.0],
-        "model__reg_lambda": [0.5, 1.0, 2.0, 5.0],
+        "model__n_estimators": [500, 700, 900, 1100, 1300],
+        "model__learning_rate": [0.02, 0.03, 0.04, 0.05, 0.07],
+        "model__max_depth": [4, 5, 6, 7, 8],
+        "model__min_child_weight": [1, 2, 3, 4, 6],
+        "model__subsample": [0.8, 0.85, 0.9, 0.95, 1.0],
+        "model__colsample_bytree": [0.75, 0.85, 0.9, 0.95, 1.0],
+        "model__gamma": [0.0, 0.05, 0.1, 0.2],
+        "model__reg_alpha": [0.0, 0.001, 0.01, 0.05, 0.1],
+        "model__reg_lambda": [0.8, 1.0, 1.5, 2.0, 3.0],
     }
 
 
@@ -1987,12 +2012,14 @@ def main() -> None:
 
     xgb_feature_view_requested = args.xgb_feature_view
     xgb_complementary_drop_cols = parse_feature_list(args.xgb_complementary_drop_cols)
+    xgb_add_all_interactions = not args.no_xgb_all_interactions
     xgb_add_complementary_interactions = not args.no_xgb_complementary_interactions
     xgb_train_aug_for_tune, xgb_feature_view_info = prepare_xgb_residual_features(
         x=x_train_aug_for_tune,
         residual_model=args.residual_model,
         xgb_feature_view=xgb_feature_view_requested,
         complementary_drop_cols=xgb_complementary_drop_cols,
+        add_all_interactions=xgb_add_all_interactions,
         add_complementary_interactions=xgb_add_complementary_interactions,
     )
     xgb_train_aug_for_fit, _ = prepare_xgb_residual_features(
@@ -2000,6 +2027,7 @@ def main() -> None:
         residual_model=args.residual_model,
         xgb_feature_view=xgb_feature_view_requested,
         complementary_drop_cols=xgb_complementary_drop_cols,
+        add_all_interactions=xgb_add_all_interactions,
         add_complementary_interactions=xgb_add_complementary_interactions,
     )
     xgb_test_aug, _ = prepare_xgb_residual_features(
@@ -2007,6 +2035,7 @@ def main() -> None:
         residual_model=args.residual_model,
         xgb_feature_view=xgb_feature_view_requested,
         complementary_drop_cols=xgb_complementary_drop_cols,
+        add_all_interactions=xgb_add_all_interactions,
         add_complementary_interactions=xgb_add_complementary_interactions,
     )
 

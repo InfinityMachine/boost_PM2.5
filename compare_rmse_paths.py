@@ -39,13 +39,6 @@ except ImportError as exc:
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-matplotlib.rcParams["font.sans-serif"] = [
-    "Microsoft YaHei",
-    "SimHei",
-    "Noto Sans CJK SC",
-    "Arial Unicode MS",
-    "DejaVu Sans",
-]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 from train_pm25_trend_residual_xgboost import (
@@ -183,6 +176,11 @@ def parse_args() -> argparse.Namespace:
         help="关闭 XGBoost complementary 视图下的默认数值交互特征",
     )
     parser.add_argument(
+        "--no-xgb-all-interactions",
+        action="store_true",
+        help="关闭 XGBoost all 视图下的默认精选交互特征",
+    )
+    parser.add_argument(
         "--ensemble-weight-grid-step",
         type=float,
         default=0.02,
@@ -312,16 +310,16 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
         test_rmse,
         width=bar_width,
         color="#2F6BFF",
-        label="整体 RMSE",
+        label="Overall RMSE",
     )
     axes[0].bar(
         [pos + bar_width / 2 for pos in x_positions],
         high_rmse,
         width=bar_width,
         color="#FF7A45",
-        label="高污染子集 RMSE",
+        label="High-PM2.5 RMSE",
     )
-    axes[0].set_title("不同路径的 RMSE 对比")
+    axes[0].set_title("RMSE by Modeling Path")
     axes[0].set_ylabel("RMSE")
     axes[0].set_xticks(x_positions)
     axes[0].set_xticklabels(labels, rotation=25, ha="right")
@@ -332,8 +330,8 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
     gap_colors = ["#5B8C00" if gap <= 0 else "#BFBFBF" for gap in rmse_gap]
     axes[1].bar(x_positions, rmse_gap, color=gap_colors)
     axes[1].axhline(0.0, color="#595959", linewidth=1.0)
-    axes[1].set_title("高污染 RMSE 与整体 RMSE 的差值")
-    axes[1].set_ylabel("high_pm25_rmse - test_rmse")
+    axes[1].set_title("High-PM2.5 vs Overall RMSE Gap")
+    axes[1].set_ylabel("High-PM2.5 RMSE - Overall RMSE")
     axes[1].set_xticks(x_positions)
     axes[1].set_xticklabels(labels, rotation=25, ha="right")
     axes[1].grid(axis="y", linestyle="--", alpha=0.25)
@@ -343,7 +341,7 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
     axes[0].text(
         x=plot_df.index.get_loc(best_overall_idx) - bar_width / 2,
         y=plot_df.loc[best_overall_idx, "test_rmse"],
-        s="  最优",
+        s="  Best",
         va="bottom",
         ha="left",
         fontsize=9,
@@ -352,7 +350,7 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
     axes[0].text(
         x=plot_df.index.get_loc(best_high_idx) + bar_width / 2,
         y=plot_df.loc[best_high_idx, "high_pm25_rmse"],
-        s="  最优",
+        s="  Best",
         va="bottom",
         ha="left",
         fontsize=9,
@@ -363,7 +361,7 @@ def plot_path_comparison_chart(results_df: pd.DataFrame, plot_path: Path) -> Non
         axis.spines["top"].set_visible(False)
         axis.spines["right"].set_visible(False)
 
-    fig.suptitle("PM2.5 不同建模路径 RMSE 对比", fontsize=14)
+    fig.suptitle("PM2.5 Modeling Path Comparison", fontsize=14)
     fig.tight_layout()
     plot_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(plot_path, dpi=180, bbox_inches="tight")
@@ -385,6 +383,7 @@ def train_xgb_path(
         residual_model="ensemble",
         xgb_feature_view=xgb_feature_view,
         complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_all_interactions=not args.no_xgb_all_interactions,
         add_complementary_interactions=not args.no_xgb_complementary_interactions,
     )
     xgb_train_aug_for_fit, _ = prepare_xgb_residual_features(
@@ -392,6 +391,7 @@ def train_xgb_path(
         residual_model="ensemble",
         xgb_feature_view=xgb_feature_view,
         complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_all_interactions=not args.no_xgb_all_interactions,
         add_complementary_interactions=not args.no_xgb_complementary_interactions,
     )
     xgb_test_aug, _ = prepare_xgb_residual_features(
@@ -399,6 +399,7 @@ def train_xgb_path(
         residual_model="ensemble",
         xgb_feature_view=xgb_feature_view,
         complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_all_interactions=not args.no_xgb_all_interactions,
         add_complementary_interactions=not args.no_xgb_complementary_interactions,
     )
 

@@ -195,6 +195,11 @@ def parse_args() -> argparse.Namespace:
         help="关闭 XGBoost complementary 视图下的默认数值交互特征",
     )
     parser.add_argument(
+        "--no-xgb-all-interactions",
+        action="store_true",
+        help="关闭 XGBoost all 视图下的默认精选交互特征",
+    )
+    parser.add_argument(
         "--weights",
         default="0.55,0.60,0.65,0.70,0.75,0.80",
         help=(
@@ -442,6 +447,7 @@ def main() -> None:
         residual_model="ensemble",
         xgb_feature_view=args.xgb_feature_view,
         complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_all_interactions=not args.no_xgb_all_interactions,
         add_complementary_interactions=not args.no_xgb_complementary_interactions,
     )
     xgb_train_aug_for_fit, _ = prepare_xgb_residual_features(
@@ -449,6 +455,7 @@ def main() -> None:
         residual_model="ensemble",
         xgb_feature_view=args.xgb_feature_view,
         complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_all_interactions=not args.no_xgb_all_interactions,
         add_complementary_interactions=not args.no_xgb_complementary_interactions,
     )
     xgb_test_aug, _ = prepare_xgb_residual_features(
@@ -456,6 +463,7 @@ def main() -> None:
         residual_model="ensemble",
         xgb_feature_view=args.xgb_feature_view,
         complementary_drop_cols=parse_feature_list(args.xgb_complementary_drop_cols),
+        add_all_interactions=not args.no_xgb_all_interactions,
         add_complementary_interactions=not args.no_xgb_complementary_interactions,
     )
     print(f"[信息] XGBoost 特征视图：{xgb_feature_view_info['effective_view']}")
