@@ -64,13 +64,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-out",
-        default="pm25_xgboost_pipeline.joblib",
-        help="模型输出文件路径，默认：pm25_xgboost_pipeline.joblib",
+        default="cache/pm25_xgboost_pipeline.joblib",
+        help="模型输出文件路径，默认：cache/pm25_xgboost_pipeline.joblib",
     )
     parser.add_argument(
         "--plot-out",
-        default="pm25_xgboost_diagnostics.png",
-        help="诊断图输出路径，默认：pm25_xgboost_diagnostics.png",
+        default=".diag/pm25_xgboost_diagnostics.png",
+        help="诊断图输出路径，默认：.diag/pm25_xgboost_diagnostics.png",
     )
     parser.add_argument(
         "--keep-id-cols",
@@ -337,6 +337,7 @@ def print_top_importances(model: Pipeline, top_n: int = 20) -> None:
 def main() -> None:
     """脚本主流程：读取数据 -> 划分数据 -> 调参/训练 -> 评估 -> 保存。"""
     args = parse_args()
+    model_out = Path(args.model_out)
     plot_out = Path(args.plot_out)
 
     # 第一步：读取并校验数据
@@ -431,8 +432,9 @@ def main() -> None:
 
     # 第六步：按需保存模型
     if not args.no_save:
-        joblib.dump(best_model, args.model_out)
-        print(f"\n模型已保存到：{args.model_out}")
+        model_out.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(best_model, model_out)
+        print(f"\n模型已保存到：{model_out}")
 
 
 if __name__ == "__main__":

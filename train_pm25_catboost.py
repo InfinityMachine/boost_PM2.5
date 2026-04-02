@@ -75,13 +75,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-out",
-        default="pm25_catboost_model.cbm",
-        help="CatBoost 模型输出路径，默认：pm25_catboost_model.cbm",
+        default="cache/pm25_catboost_model.cbm",
+        help="CatBoost 模型输出路径，默认：cache/pm25_catboost_model.cbm",
     )
     parser.add_argument(
         "--meta-out",
-        default="pm25_catboost_meta.json",
-        help="模型元信息输出路径，默认：pm25_catboost_meta.json",
+        default="cache/pm25_catboost_meta.json",
+        help="模型元信息输出路径，默认：cache/pm25_catboost_meta.json",
     )
     parser.add_argument("--no-save", action="store_true", help="不保存模型和元信息")
     return parser.parse_args()
@@ -335,6 +335,8 @@ def save_artifacts(
     target_col: str,
 ) -> None:
     """保存模型文件与元信息文件。"""
+    model_out.parent.mkdir(parents=True, exist_ok=True)
+    meta_out.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(str(model_out))
 
     meta = {

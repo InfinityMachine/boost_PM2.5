@@ -268,16 +268,16 @@ def resolve_output_paths(
     """根据残差模型类型自动决定输出文件名。"""
     default_outputs = {
         "xgboost": (
-            "pm25_trend_residual_xgboost.joblib",
-            "pm25_trend_residual_xgboost_diagnostics.png",
+            "cache/pm25_trend_residual_xgboost.joblib",
+            ".diag/pm25_trend_residual_xgboost_diagnostics.png",
         ),
         "catboost": (
-            "pm25_trend_residual_catboost.joblib",
-            "pm25_trend_residual_catboost_diagnostics.png",
+            "cache/pm25_trend_residual_catboost.joblib",
+            ".diag/pm25_trend_residual_catboost_diagnostics.png",
         ),
         "ensemble": (
-            "pm25_trend_residual_ensemble.joblib",
-            "pm25_trend_residual_ensemble_diagnostics.png",
+            "cache/pm25_trend_residual_ensemble.joblib",
+            ".diag/pm25_trend_residual_ensemble_diagnostics.png",
         ),
     }
     default_model_out, default_plot_out = default_outputs[residual_model]
@@ -1819,6 +1819,7 @@ def save_artifact(
         "high_pm25_eval_config": high_pm25_eval_config,
         "model_type": f"linear_trend_plus_{residual_model_mode}_residual",
     }
+    model_out.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, model_out)
     print(f"\n模型已保存到：{model_out}")
 

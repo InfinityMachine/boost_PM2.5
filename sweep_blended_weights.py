@@ -66,10 +66,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="批量扫描 blended 联合目标权重，并输出 PM2.5 集成结果表"
     )
-    parser.add_argument("--data", default="data.csv", help="训练数据 CSV 路径，默认：data.csv")
+    parser.add_argument(
+        "--data", default="data.csv", help="训练数据 CSV 路径，默认：data.csv"
+    )
     parser.add_argument("--target", default="PM2.5", help="目标列名，默认：PM2.5")
-    parser.add_argument("--test-size", type=float, default=0.2, help="测试集比例，默认：0.2")
-    parser.add_argument("--random-state", type=int, default=42, help="随机种子，默认：42")
+    parser.add_argument(
+        "--test-size", type=float, default=0.2, help="测试集比例，默认：0.2"
+    )
+    parser.add_argument(
+        "--random-state", type=int, default=42, help="随机种子，默认：42"
+    )
     parser.add_argument(
         "--validation-mode",
         choices=["group", "random"],
@@ -208,8 +214,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--out",
-        default="pm25_blended_weight_sweep.csv",
-        help="实验结果输出 CSV 路径，默认：pm25_blended_weight_sweep.csv",
+        default=".diag/pm25_blended_weight_sweep.csv",
+        help="实验结果输出 CSV 路径，默认：.diag/pm25_blended_weight_sweep.csv",
     )
     return parser.parse_args()
 
