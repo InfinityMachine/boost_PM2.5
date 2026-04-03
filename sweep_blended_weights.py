@@ -55,11 +55,13 @@ from train_pm25_trend_residual_xgboost import (
     parse_feature_list,
     predict_catboost_residual_model,
     prepare_xgb_residual_features,
+    select_trend_feature_columns,
     remove_identifier_columns,
     resolve_ensemble_weights,
     resolve_groups,
     split_train_test_by_group,
     split_train_test_random,
+    split_train_test_within_group,
     tune_catboost_residual_model,
     tune_residual_model,
 )
@@ -82,20 +84,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--validation-mode",
-        choices=["group", "random"],
+        choices=["group", "random", "within_group"],
         default="random",
-        help="验证方式：group=按地区分组验证，random=随机切分，默认：random",
+        help=(
+            "验证方式：group=按组完全隔离，"
+            "random=随机切分，"
+            "within_group=在每个 group 内部分别切分训练/测试样本，"
+            "可保证测试样本所属城市在训练集中也有样本；默认：random"
+        ),
     )
     parser.add_argument(
         "--group-col",
         default="CITY",
-        help="分组验证使用的列名，默认：CITY。仅在 --validation-mode group 时生效",
+        help=(
+            "分组相关模式使用的列名，默认：CITY。"
+            "在 --validation-mode group 或 within_group 时生效"
+        ),
     )
     parser.add_argument(
         "--trend-model",
         choices=["ridge", "linear"],
         default="ridge",
         help="趋势模型类型，默认：ridge",
+    )
+    parser.add_argument(
+        "--trend-feature-view",
+        choices=["all", "numeric_only"],
+        default="all",
+        help=(
+            "趋势模型特征视图：all=使用数值和类别特征，"
+            "numeric_only=仅使用数值特征，让地区类别信息只对残差模型可见；默认：all"
+        ),
     )
     parser.add_argument(
         "--trend-cv-folds",
@@ -378,17 +397,35 @@ def main() -> None:
     groups = None
     groups_train = None
     groups_test = None
-    if args.validation_mode == "group":
+    within_group_split_info: dict[str, Any] | None = None
+    if args.validation_mode in ("group", "within_group"):
         groups = resolve_groups(x, args.group_col)
-        x_train, x_test, y_train, y_test, groups_train, groups_test = (
-            split_train_test_by_group(
+        if args.validation_mode == "group":
+            x_train, x_test, y_train, y_test, groups_train, groups_test = (
+                split_train_test_by_group(
+                    x=x,
+                    y=y,
+                    groups=groups,
+                    test_size=args.test_size,
+                    random_state=args.random_state,
+                )
+            )
+        else:
+            (
+                x_train,
+                x_test,
+                y_train,
+                y_test,
+                groups_train,
+                groups_test,
+                within_group_split_info,
+            ) = split_train_test_within_group(
                 x=x,
                 y=y,
                 groups=groups,
                 test_size=args.test_size,
                 random_state=args.random_state,
             )
-        )
     else:
         x_train, x_test, y_train, y_test = split_train_test_random(
             x=x,
@@ -400,14 +437,34 @@ def main() -> None:
     print(f"[信息] 当前训练设备：{args.device.upper()}")
     print(f"[信息] 当前运行目录：{run_name}")
     print(f"[信息] 当前趋势模型：{args.trend_model}")
+    print(f"[信息] 当前趋势特征视图：{args.trend_feature_view}")
     print(f"[信息] 当前验证方式：{args.validation_mode}")
     print(f"[信息] blended 权重候选：{weight_candidates}")
-    if args.validation_mode == "group":
+    if args.validation_mode in ("group", "within_group"):
         print(f"[信息] 当前分组列：{args.group_col}")
-        print(
-            f"[信息] 分组统计：总组数={groups.nunique()}，"
-            f"训练组数={groups_train.nunique()}，测试组数={groups_test.nunique()}"
-        )
+        if args.validation_mode == "group":
+            print(
+                f"[信息] 分组统计：总组数={groups.nunique()}，"
+                f"训练组数={groups_train.nunique()}，测试组数={groups_test.nunique()}"
+            )
+        else:
+            print(
+                "[信息] 组内切分统计："
+                f"总组数={within_group_split_info['total_groups']}，"
+                f"训练组数={within_group_split_info['train_groups']}，"
+                f"测试组数={within_group_split_info['test_groups']}，"
+                f"训练/测试共享组数={within_group_split_info['shared_groups']}"
+            )
+            print(
+                "[信息] 组内切分比例："
+                f"目标测试比例={args.test_size:.2f}，"
+                f"实际测试比例={within_group_split_info['actual_test_size']:.4f}"
+            )
+            if within_group_split_info["singleton_train_only_groups"] > 0:
+                print(
+                    "[信息] 仅 1 条样本的组已强制保留在训练集："
+                    f"{within_group_split_info['singleton_train_only_groups']} 个"
+                )
 
     sample_weight_config = build_sample_weight_config(
         y_train=y_train,
@@ -430,6 +487,12 @@ def main() -> None:
         f"threshold={high_pm25_eval_config['threshold']:.4f}"
     )
 
+    trend_feature_cols = select_trend_feature_columns(
+        x=x_train,
+        trend_feature_view=args.trend_feature_view,
+    )
+    print(f"[信息] 当前趋势模型可见特征数：{len(trend_feature_cols)}")
+
     # 3) 趋势层只训练一次
     print(f"[信息] 开始生成线性趋势 OOF 预测：trend_cv_folds={args.trend_cv_folds}")
     trend_train_oof_pred = generate_oof_trend_predictions(
@@ -440,15 +503,17 @@ def main() -> None:
         random_state=args.random_state,
         validation_mode=args.validation_mode,
         trend_model=args.trend_model,
+        trend_feature_view=args.trend_feature_view,
         weight_config=sample_weight_config,
     )
     trend_model = fit_final_trend_model(
         x_train=x_train,
         y_train=y_train,
         trend_model=args.trend_model,
+        trend_feature_view=args.trend_feature_view,
         sample_weight=trend_sample_weight,
     )
-    trend_test_pred = trend_model.predict(x_test)
+    trend_test_pred = trend_model.predict(x_test[trend_feature_cols])
     trend_metrics = calculate_metrics(y_test, trend_test_pred)
     trend_high_metrics, trend_high_count = calculate_high_pm25_metrics(
         y_true=y_test,

@@ -163,6 +163,17 @@ def parse_args() -> argparse.Namespace:
         help="趋势模型类型：ridge=RidgeCV（默认，推荐），linear=普通线性回归",
     )
     parser.add_argument(
+        "--trend-feature-view",
+        choices=["all", "numeric_only"],
+        default="all",
+        help=(
+            "趋势模型可见的特征视图："
+            "all=同时使用数值与类别特征，"
+            "numeric_only=仅使用数值特征，让地区等类别信息仅对残差模型可见；"
+            "默认：all"
+        ),
+    )
+    parser.add_argument(
         "--residual-model",
         choices=["xgboost", "catboost", "catboost_experts", "ensemble"],
         default="xgboost",
@@ -238,14 +249,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--validation-mode",
-        choices=["group", "random"],
+        choices=["group", "random", "within_group"],
         default="random",
-        help="验证方式：group=按地区分组验证，random=随机切分与随机交叉验证，默认：random",
+        help=(
+            "验证方式：group=按组完全隔离，"
+            "random=随机切分与随机交叉验证，"
+            "within_group=在每个 group 内部分别切分训练/测试样本，"
+            "可确保测试样本所属城市在训练集中也有样本；默认：random"
+        ),
     )
     parser.add_argument(
         "--group-col",
         default="CITY",
-        help="分组验证使用的列名，默认：CITY。仅在 --validation-mode group 时生效",
+        help=(
+            "分组相关模式使用的列名，默认：CITY。"
+            "在 --validation-mode group 或 within_group 时生效"
+        ),
     )
     parser.add_argument(
         "--trend-cv-folds",
@@ -1074,9 +1093,129 @@ def build_cv_split_indices(
         validate_group_folds(groups_data, cv_folds, stage_name)
         splitter = GroupKFold(n_splits=cv_folds)
         return list(splitter.split(x_data, y_data, groups_data))
+    if validation_mode == "within_group":
+        if groups_data is None:
+            raise ValueError(f"{stage_name} 在组内切分模式下需要 groups_data。")
+        return build_within_group_cv_split_indices(
+            groups=groups_data,
+            cv_folds=cv_folds,
+            random_state=random_state,
+            stage_name=stage_name,
+        )
 
     splitter = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
     return list(splitter.split(x_data, y_data))
+
+
+def build_within_group_cv_split_indices(
+    groups: pd.Series,
+    cv_folds: int,
+    random_state: int,
+    stage_name: str,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    在每个 group 内部做交叉验证切分。
+
+    设计目标：
+    1. 每一折的训练集与验证集尽量都覆盖相同的城市；
+    2. 这样生成的 OOF 预测更接近“同城已见”的评估设定；
+    3. 对只有 1 条样本的 group，无法同时保证 train/val 都包含该 group，
+       因此这类样本会被分配到某一折的验证集中。
+    """
+    group_series = groups.fillna("__MISSING_GROUP__").astype(str).reset_index(drop=True)
+    if len(group_series) < cv_folds:
+        raise ValueError(
+            f"{stage_name} 需要至少 {cv_folds} 条样本，但当前只有 {len(group_series)} 条。"
+        )
+
+    rng = np.random.RandomState(random_state)
+    val_indices_per_fold: list[list[int]] = [[] for _ in range(cv_folds)]
+    grouped_indices = group_series.groupby(group_series, sort=False).indices
+
+    for group_indices in grouped_indices.values():
+        shuffled_idx = rng.permutation(np.asarray(group_indices, dtype=int))
+        for offset, sample_idx in enumerate(shuffled_idx):
+            val_indices_per_fold[offset % cv_folds].append(int(sample_idx))
+
+    all_idx = np.arange(len(group_series), dtype=int)
+    split_indices: list[tuple[np.ndarray, np.ndarray]] = []
+    for fold_no, val_list in enumerate(val_indices_per_fold, start=1):
+        if not val_list:
+            raise ValueError(f"{stage_name} 的第 {fold_no} 折验证集为空。")
+
+        val_idx = np.asarray(sorted(val_list), dtype=int)
+        train_mask = np.ones(len(all_idx), dtype=bool)
+        train_mask[val_idx] = False
+        train_idx = all_idx[train_mask]
+        if len(train_idx) == 0:
+            raise ValueError(f"{stage_name} 的第 {fold_no} 折训练集为空。")
+        split_indices.append((train_idx, val_idx))
+
+    return split_indices
+
+
+def build_within_group_holdout_indices(
+    groups: pd.Series,
+    test_size: float,
+    random_state: int,
+    stage_name: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """
+    在每个 group 内部切分训练集和测试集。
+
+    这样做可以保证：
+    - 绝大多数测试样本所在城市在训练集中也有样本；
+    - 更适合评估“同城已见、但样本未见”的设定。
+
+    对只有 1 条样本的 group，不可能同时切出 train/test，
+    因此会强制保留在训练集，以满足“测试样本城市已见”的目标。
+    """
+    if not 0.0 < test_size < 1.0:
+        raise ValueError(f"{stage_name} 的 test_size 必须在 (0, 1) 之间。")
+
+    group_series = groups.fillna("__MISSING_GROUP__").astype(str).reset_index(drop=True)
+    rng = np.random.RandomState(random_state)
+    grouped_indices = group_series.groupby(group_series, sort=False).indices
+
+    train_idx_list: list[int] = []
+    test_idx_list: list[int] = []
+    singleton_train_only_groups = 0
+
+    for group_indices in grouped_indices.values():
+        shuffled_idx = rng.permutation(np.asarray(group_indices, dtype=int))
+        group_size = len(shuffled_idx)
+
+        if group_size < 2:
+            train_idx_list.extend(shuffled_idx.tolist())
+            singleton_train_only_groups += 1
+            continue
+
+        n_test = int(round(group_size * test_size))
+        n_test = max(1, min(n_test, group_size - 1))
+        test_idx_list.extend(shuffled_idx[:n_test].tolist())
+        train_idx_list.extend(shuffled_idx[n_test:].tolist())
+
+    if not test_idx_list:
+        raise ValueError(
+            f"{stage_name} 未生成任何测试样本，请检查 group 列是否全部为单样本分组。"
+        )
+
+    train_idx = np.asarray(sorted(train_idx_list), dtype=int)
+    test_idx = np.asarray(sorted(test_idx_list), dtype=int)
+
+    train_groups = group_series.iloc[train_idx]
+    test_groups = group_series.iloc[test_idx]
+    shared_groups = pd.Index(train_groups.unique()).intersection(test_groups.unique())
+
+    split_info = {
+        "total_groups": int(group_series.nunique()),
+        "train_groups": int(train_groups.nunique()),
+        "test_groups": int(test_groups.nunique()),
+        "shared_groups": int(shared_groups.size),
+        "singleton_train_only_groups": int(singleton_train_only_groups),
+        "actual_test_size": float(len(test_idx) / len(group_series)),
+    }
+    return train_idx, test_idx, split_info
 
 
 def split_train_test_by_group(
@@ -1107,6 +1246,44 @@ def split_train_test_by_group(
     groups_train = groups.iloc[train_idx].copy()
     groups_test = groups.iloc[test_idx].copy()
     return x_train, x_test, y_train, y_test, groups_train, groups_test
+
+
+def split_train_test_within_group(
+    x: pd.DataFrame,
+    y: pd.Series,
+    groups: pd.Series,
+    test_size: float,
+    random_state: int,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    dict[str, Any],
+]:
+    """
+    在每个 group 内部分别切分训练/测试样本。
+
+    这与 group 模式的差别在于：
+    - group：测试集中的城市在训练集中完全不可见；
+    - within_group：同一城市内部切样本，测试集中的城市通常在训练集中也可见。
+    """
+    train_idx, test_idx, split_info = build_within_group_holdout_indices(
+        groups=groups,
+        test_size=test_size,
+        random_state=random_state,
+        stage_name="组内训练/测试切分",
+    )
+
+    x_train = x.iloc[train_idx].copy()
+    x_test = x.iloc[test_idx].copy()
+    y_train = y.iloc[train_idx].copy()
+    y_test = y.iloc[test_idx].copy()
+    groups_train = groups.iloc[train_idx].copy()
+    groups_test = groups.iloc[test_idx].copy()
+    return x_train, x_test, y_train, y_test, groups_train, groups_test, split_info
 
 
 def split_train_test_random(
@@ -1175,6 +1352,30 @@ def build_linear_trend_pipeline(x: pd.DataFrame, trend_model: str) -> Pipeline:
             ("model", trend_estimator),
         ]
     )
+
+
+def select_trend_feature_columns(
+    x: pd.DataFrame,
+    trend_feature_view: str,
+) -> list[str]:
+    """
+    选择趋势模型可见的特征列。
+
+    设计动机：
+    1. `all` 视图允许趋势模型同时利用数值和类别信息；
+    2. `numeric_only` 视图则强制趋势模型只看数值特征，
+       让地区类别这种更局部、更离散的信息留给残差模型处理。
+    """
+    if trend_feature_view == "all":
+        return x.columns.tolist()
+
+    if trend_feature_view == "numeric_only":
+        numeric_cols = x.select_dtypes(include=["number"]).columns.tolist()
+        if not numeric_cols:
+            raise ValueError("trend-feature-view=numeric_only 时未找到任何数值特征。")
+        return numeric_cols
+
+    raise ValueError(f"不支持的趋势特征视图：{trend_feature_view}")
 
 
 def prepare_catboost_features(x: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -1412,6 +1613,44 @@ def calculate_high_pm25_metrics(
     return metrics, high_count
 
 
+def calculate_mask_overlap_statistics(
+    reference_mask: np.ndarray,
+    candidate_mask: np.ndarray,
+) -> dict[str, float]:
+    """
+    计算两个布尔掩码之间的重合统计。
+
+    在 CatBoost 专家模型中，主要用于回答：
+    1. 专家 regime 覆盖了多少真实高污染样本；
+    2. 被判进专家 regime 的样本中，有多少确实属于高污染子集。
+    """
+    reference_mask = np.asarray(reference_mask, dtype=bool)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if reference_mask.shape != candidate_mask.shape:
+        raise ValueError("计算掩码重合统计时，两个 mask 的长度必须一致。")
+
+    reference_count = int(reference_mask.sum())
+    candidate_count = int(candidate_mask.sum())
+    overlap_mask = np.logical_and(reference_mask, candidate_mask)
+    overlap_count = int(overlap_mask.sum())
+    union_count = int(np.logical_or(reference_mask, candidate_mask).sum())
+
+    return {
+        "reference_count": float(reference_count),
+        "candidate_count": float(candidate_count),
+        "overlap_count": float(overlap_count),
+        "reference_hit_rate": (
+            float(overlap_count / reference_count) if reference_count > 0 else float("nan")
+        ),
+        "candidate_precision": (
+            float(overlap_count / candidate_count) if candidate_count > 0 else float("nan")
+        ),
+        "jaccard_similarity": (
+            float(overlap_count / union_count) if union_count > 0 else float("nan")
+        ),
+    }
+
+
 def save_diagnostic_plot(
     y_true: pd.Series | np.ndarray,
     y_pred: np.ndarray,
@@ -1490,6 +1729,7 @@ def generate_oof_trend_predictions(
     random_state: int,
     validation_mode: str,
     trend_model: str,
+    trend_feature_view: str,
     weight_config: dict[str, float] | None,
 ) -> np.ndarray:
     """
@@ -1515,12 +1755,16 @@ def generate_oof_trend_predictions(
         stage_name="趋势模型交叉验证",
     )
 
+    trend_feature_cols = select_trend_feature_columns(
+        x=x_train,
+        trend_feature_view=trend_feature_view,
+    )
     oof_pred = np.zeros(len(x_train), dtype=float)
 
     for fold_no, (tr_idx, val_idx) in enumerate(split_indices, start=1):
-        x_tr = x_train.iloc[tr_idx]
+        x_tr = x_train.iloc[tr_idx][trend_feature_cols]
         y_tr = y_train.iloc[tr_idx]
-        x_val = x_train.iloc[val_idx]
+        x_val = x_train.iloc[val_idx][trend_feature_cols]
         y_val = y_train.iloc[val_idx]
         fold_weights = compute_sample_weights(y_tr, weight_config)
 
@@ -1545,14 +1789,20 @@ def fit_final_trend_model(
     x_train: pd.DataFrame,
     y_train: pd.Series,
     trend_model: str,
+    trend_feature_view: str,
     sample_weight: np.ndarray | None,
 ) -> Pipeline:
     """在完整训练集上拟合最终线性趋势模型。"""
-    trend_pipeline = build_linear_trend_pipeline(x_train, trend_model)
+    trend_feature_cols = select_trend_feature_columns(
+        x=x_train,
+        trend_feature_view=trend_feature_view,
+    )
+    x_train_trend = x_train[trend_feature_cols]
+    trend_pipeline = build_linear_trend_pipeline(x_train_trend, trend_model)
     if sample_weight is None:
-        trend_pipeline.fit(x_train, y_train)
+        trend_pipeline.fit(x_train_trend, y_train)
     else:
-        trend_pipeline.fit(x_train, y_train, model__sample_weight=sample_weight)
+        trend_pipeline.fit(x_train_trend, y_train, model__sample_weight=sample_weight)
     return trend_pipeline
 
 
@@ -1813,6 +2063,13 @@ def fit_catboost_model_with_internal_validation(
                 )
                 fit_idx, val_idx = next(
                     splitter.split(x_train_cb, residual_target, groups_train)
+                )
+            elif validation_mode == "within_group" and groups_train is not None:
+                fit_idx, val_idx, _ = build_within_group_holdout_indices(
+                    groups=groups_train,
+                    test_size=0.15,
+                    random_state=random_state,
+                    stage_name="CatBoost 内部验证切分",
                 )
             else:
                 fit_idx, val_idx = train_test_split(
@@ -2410,6 +2667,8 @@ def print_top_catboost_residual_importances(
 
 def save_artifact(
     trend_model: Pipeline,
+    trend_feature_view: str,
+    trend_feature_cols: list[str],
     residual_model_mode: str,
     xgboost_residual_model: Pipeline | None,
     xgboost_feature_view_info: dict[str, Any],
@@ -2432,10 +2691,14 @@ def save_artifact(
     split_strategy = (
         "GroupShuffleSplit + GroupKFold"
         if validation_mode == "group"
+        else "within-group holdout + within-group CV"
+        if validation_mode == "within_group"
         else "train_test_split + KFold"
     )
     artifact = {
         "trend_model": trend_model,
+        "trend_feature_view": trend_feature_view,
+        "trend_feature_cols": trend_feature_cols,
         "residual_model": (
             xgboost_residual_model
             if residual_model_mode == "xgboost"
@@ -2516,19 +2779,37 @@ def main() -> None:
     groups: pd.Series | None = None
     groups_train: pd.Series | None = None
     groups_test: pd.Series | None = None
+    within_group_split_info: dict[str, Any] | None = None
 
     # 2) 按配置选择验证方式
-    if args.validation_mode == "group":
+    if args.validation_mode in ("group", "within_group"):
         groups = resolve_groups(x, args.group_col)
-        x_train, x_test, y_train, y_test, groups_train, groups_test = (
-            split_train_test_by_group(
+        if args.validation_mode == "group":
+            x_train, x_test, y_train, y_test, groups_train, groups_test = (
+                split_train_test_by_group(
+                    x=x,
+                    y=y,
+                    groups=groups,
+                    test_size=args.test_size,
+                    random_state=args.random_state,
+                )
+            )
+        else:
+            (
+                x_train,
+                x_test,
+                y_train,
+                y_test,
+                groups_train,
+                groups_test,
+                within_group_split_info,
+            ) = split_train_test_within_group(
                 x=x,
                 y=y,
                 groups=groups,
                 test_size=args.test_size,
                 random_state=args.random_state,
             )
-        )
     else:
         x_train, x_test, y_train, y_test = split_train_test_random(
             x=x,
@@ -2537,19 +2818,45 @@ def main() -> None:
             random_state=args.random_state,
         )
 
+    trend_feature_cols = select_trend_feature_columns(
+        x=x_train,
+        trend_feature_view=args.trend_feature_view,
+    )
+
     print(f"[信息] 当前训练设备：{args.device.upper()}")
     if args.device == "gpu":
         print(f"[信息] 使用 GPU 编号：{args.gpu_id}")
     print(f"[信息] 当前运行目录：{run_name}")
     print(f"[信息] 当前趋势模型：{args.trend_model}")
+    print(f"[信息] 当前趋势特征视图：{args.trend_feature_view}")
+    print(f"[信息] 趋势模型可见特征数：{len(trend_feature_cols)}")
     print(f"[信息] 当前残差模型：{args.residual_model}")
     print(f"[信息] 当前验证方式：{args.validation_mode}")
-    if args.validation_mode == "group":
+    if args.validation_mode in ("group", "within_group"):
         print(f"[信息] 当前分组列：{args.group_col}")
-        print(
-            f"[信息] 分组统计：总组数={groups.nunique()}，"
-            f"训练组数={groups_train.nunique()}，测试组数={groups_test.nunique()}"
-        )
+        if args.validation_mode == "group":
+            print(
+                f"[信息] 分组统计：总组数={groups.nunique()}，"
+                f"训练组数={groups_train.nunique()}，测试组数={groups_test.nunique()}"
+            )
+        else:
+            print(
+                "[信息] 组内切分统计："
+                f"总组数={within_group_split_info['total_groups']}，"
+                f"训练组数={within_group_split_info['train_groups']}，"
+                f"测试组数={within_group_split_info['test_groups']}，"
+                f"训练/测试共享组数={within_group_split_info['shared_groups']}"
+            )
+            print(
+                "[信息] 组内切分比例："
+                f"目标测试比例={args.test_size:.2f}，"
+                f"实际测试比例={within_group_split_info['actual_test_size']:.4f}"
+            )
+            if within_group_split_info["singleton_train_only_groups"] > 0:
+                print(
+                    "[信息] 仅 1 条样本的组已强制保留在训练集："
+                    f"{within_group_split_info['singleton_train_only_groups']} 个"
+                )
 
     sample_weight_config = build_sample_weight_config(
         y_train=y_train,
@@ -2582,6 +2889,7 @@ def main() -> None:
         random_state=args.random_state,
         validation_mode=args.validation_mode,
         trend_model=args.trend_model,
+        trend_feature_view=args.trend_feature_view,
         weight_config=sample_weight_config,
     )
 
@@ -2590,9 +2898,10 @@ def main() -> None:
         x_train=x_train,
         y_train=y_train,
         trend_model=args.trend_model,
+        trend_feature_view=args.trend_feature_view,
         sample_weight=trend_sample_weight,
     )
-    trend_test_pred = trend_model.predict(x_test)
+    trend_test_pred = trend_model.predict(x_test[trend_feature_cols])
 
     # 5) 训练残差模型时，使用 OOF 趋势预测构造更真实的残差标签
     residual_train_oof = y_train - trend_train_oof_pred
@@ -2923,6 +3232,7 @@ def main() -> None:
     cat_expert_general_test_pred: np.ndarray | None = None
     cat_expert_special_test_pred: np.ndarray | None = None
     cat_expert_special_mask: np.ndarray | None = None
+    cat_expert_overlap_stats: dict[str, float] | None = None
     xgb_final_test_pred: np.ndarray | None = None
     cat_final_test_pred: np.ndarray | None = None
     cat_expert_final_test_pred: np.ndarray | None = None
@@ -2997,6 +3307,12 @@ def main() -> None:
         y_pred=final_test_pred,
         threshold=high_pm25_eval_config["threshold"],
     )
+    if cat_expert_special_mask is not None:
+        high_pm25_mask = y_test.to_numpy(dtype=float) >= high_pm25_eval_config["threshold"]
+        cat_expert_overlap_stats = calculate_mask_overlap_statistics(
+            reference_mask=high_pm25_mask,
+            candidate_mask=cat_expert_special_mask,
+        )
 
     rmse_gain = trend_metrics["RMSE"] - hybrid_metrics["RMSE"]
     mae_gain = trend_metrics["MAE"] - hybrid_metrics["MAE"]
@@ -3050,6 +3366,23 @@ def main() -> None:
             print(
                 "特殊 regime 测试样本数      : "
                 f"{int(cat_expert_special_mask.sum())}"
+            )
+        if cat_expert_overlap_stats is not None:
+            print(
+                "专家/高污染重合样本数        : "
+                f"{int(cat_expert_overlap_stats['overlap_count'])}"
+            )
+            print(
+                "高污染样本命中率            : "
+                f"{cat_expert_overlap_stats['reference_hit_rate']:.2%}"
+            )
+            print(
+                "专家 regime 纯度           : "
+                f"{cat_expert_overlap_stats['candidate_precision']:.2%}"
+            )
+            print(
+                "专家-高污染 Jaccard        : "
+                f"{cat_expert_overlap_stats['jaccard_similarity']:.4f}"
             )
     if args.residual_model == "ensemble":
         print(
@@ -3177,6 +3510,8 @@ def main() -> None:
     if not args.no_save:
         save_artifact(
             trend_model=trend_model,
+            trend_feature_view=args.trend_feature_view,
+            trend_feature_cols=trend_feature_cols,
             residual_model_mode=args.residual_model,
             xgboost_residual_model=xgb_residual_model,
             xgboost_feature_view_info=xgb_feature_view_info,

@@ -236,7 +236,7 @@ python train_pm25_trend_residual_xgboost.py --residual-model catboost --device g
 
 | 参数 | 类型 | 默认值 | 含义 |
 |---|---|---:|---|
-| `--validation-mode` | `group/random` | `random` | 验证方式 |
+| `--validation-mode` | `group/random/within_group` | `random` | 验证方式 |
 | `--group-col` | str | `CITY` | 分组验证使用的列 |
 | `--trend-cv-folds` | int | `5` | 趋势 OOF 折数 |
 | `--residual-cv-folds` | int | `5` | 残差调参 / OOF 折数 |
@@ -247,6 +247,7 @@ python train_pm25_trend_residual_xgboost.py --residual-model catboost --device g
 
 - 如果当前目标是优化全局 RMSE，优先从 `--validation-mode random` 开始
 - 如果更关心跨城市泛化，使用 `--validation-mode group --group-col CITY`
+- 如果你希望测试集样本所属城市在训练集中也出现过，使用 `--validation-mode within_group --group-col CITY`
 
 
 #### 3. 趋势模型参数
@@ -254,11 +255,14 @@ python train_pm25_trend_residual_xgboost.py --residual-model catboost --device g
 | 参数 | 类型 | 默认值 | 含义 |
 |---|---|---:|---|
 | `--trend-model` | `ridge/linear` | `ridge` | 趋势模型类型 |
+| `--trend-feature-view` | `all/numeric_only` | `all` | 趋势模型可见的特征视图 |
 
 说明：
 
 - `ridge` 是当前推荐默认值
 - `linear` 适合做基线对照
+- `all` 允许趋势模型看到数值和类别特征
+- `numeric_only` 强制趋势模型只看数值特征，让地区类别信息只对残差模型可见
 
 
 #### 4. 残差模型参数
@@ -615,4 +619,3 @@ Falling back to prediction using DMatrix due to mismatched devices
 2. 对 `catboost_experts` 单独做 regime 和权重扫描
 3. 联合评估区域先验与 `COUNTY` 消融
 4. 在 `random` 与 `group` 两种验证模式下分别复核结论
-
