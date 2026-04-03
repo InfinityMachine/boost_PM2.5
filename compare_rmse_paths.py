@@ -11,9 +11,10 @@
 1. trend + xgboost(all)
 2. trend + xgboost(complementary)
 3. trend + catboost
-4. trend + ensemble(overall, all)
-5. trend + ensemble(overall, complementary)
-6. trend + ensemble(blended, complementary)
+4. trend + catboost_experts
+5. trend + ensemble(overall, all)
+6. trend + ensemble(overall, complementary)
+7. trend + ensemble(blended, complementary)
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ from train_pm25_trend_residual_xgboost import (
     describe_sample_weighting,
     describe_trend_model,
     fit_final_catboost_residual_model,
+    fit_catboost_regime_expert_bundle,
     fit_final_residual_model,
     fit_final_trend_model,
     generate_region_prior_features,
@@ -64,6 +66,7 @@ from train_pm25_trend_residual_xgboost import (
     load_data,
     make_augmented_features,
     parse_feature_list,
+    predict_catboost_regime_expert_bundle,
     predict_catboost_residual_model,
     prepare_xgb_residual_features,
     remove_identifier_columns,
@@ -80,6 +83,7 @@ DEFAULT_PATHS = (
     "xgb_all",
     "xgb_complementary",
     "catboost",
+    "catboost_experts",
     "ensemble_overall_all",
     "ensemble_overall_complementary",
     "ensemble_blended_complementary",
@@ -167,6 +171,41 @@ def parse_args() -> argparse.Namespace:
         help="需要生成 log1p 特征的列名，逗号分隔",
     )
     parser.add_argument("--no-log-features", action="store_true", help="关闭 log1p 特征扩展")
+    parser.add_argument(
+        "--catboost-expert-regime",
+        choices=["trend_high", "low_wind", "trend_high_or_low_wind"],
+        default="trend_high_or_low_wind",
+        help=(
+            "CatBoost 专家模型的特殊 regime。"
+            "trend_high=趋势预测较高的样本，"
+            "low_wind=低风速样本，"
+            "trend_high_or_low_wind=两者取并集，默认：trend_high_or_low_wind"
+        ),
+    )
+    parser.add_argument(
+        "--catboost-expert-trend-quantile",
+        type=float,
+        default=0.75,
+        help="使用趋势预测划分高污染 regime 的分位数阈值，默认：0.75",
+    )
+    parser.add_argument(
+        "--catboost-expert-low-wind-quantile",
+        type=float,
+        default=0.35,
+        help="使用 wind 划分低风速 regime 的分位数阈值，默认：0.35",
+    )
+    parser.add_argument(
+        "--catboost-expert-special-weight",
+        type=float,
+        default=0.75,
+        help="特殊 regime 内特殊专家预测的融合权重，默认：0.75",
+    )
+    parser.add_argument(
+        "--catboost-expert-min-samples",
+        type=int,
+        default=120,
+        help="特殊 regime 最少训练样本数，小于该值则退化为普通 CatBoost，默认：120",
+    )
     parser.add_argument(
         "--region-prior-cols",
         default="PROVINCE,CITY",
@@ -428,6 +467,7 @@ def build_result_row(
     region_prior_label: str,
     county_ablation_label: str,
     county_removed_cols: list[str],
+    expert_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metrics = calculate_metrics(y_test, final_test_pred)
     high_metrics, high_count = calculate_high_pm25_metrics(
@@ -435,6 +475,7 @@ def build_result_row(
         y_pred=final_test_pred,
         threshold=high_pm25_threshold,
     )
+    expert_config = expert_config or {}
     return {
         "path_name": path_name,
         "path_type": path_type,
@@ -450,6 +491,13 @@ def build_result_row(
         "region_prior_enabled": bool(region_prior_enabled),
         "region_prior_smoothing": region_prior_smoothing,
         "region_prior_label": region_prior_label,
+        "expert_regime_requested": expert_config.get("requested_regime_mode", ""),
+        "expert_regime_effective": expert_config.get("effective_regime_mode", ""),
+        "expert_special_enabled": bool(expert_config.get("special_expert_enabled", False)),
+        "expert_special_weight": expert_config.get("special_weight"),
+        "expert_special_train_count": expert_config.get("special_train_count"),
+        "expert_special_train_fraction": expert_config.get("special_train_fraction"),
+        "expert_special_test_count": expert_config.get("special_test_count"),
         "test_rmse": float(metrics["RMSE"]),
         "test_mae": float(metrics["MAE"]),
         "test_r2": float(metrics["R2"]),
@@ -798,6 +846,7 @@ def evaluate_paths_for_region_prior_setting(
 
     need_cat = any("catboost" in path or "ensemble" in path for path in path_candidates)
     cat_bundle: dict[str, Any] | None = None
+    cat_expert_bundle: dict[str, Any] | None = None
     if need_cat:
         print("\n[信息] 训练路径：trend + CatBoost")
         cat_best_params = None
@@ -862,9 +911,34 @@ def evaluate_paths_for_region_prior_setting(
                 "best_params": cat_best_params,
                 "best_cv_rmse": cat_best_cv_rmse,
                 "model": cat_model,
+                "feature_cols": cat_feature_cols,
+                "categorical_cols": cat_categorical_cols,
                 "test_pred": cat_test_pred,
                 "oof_pred": cat_oof_pred,
             }
+
+            if "catboost_experts" in path_candidates:
+                print("\n[信息] 训练路径：trend + CatBoost regime experts")
+                cat_expert_bundle = fit_catboost_regime_expert_bundle(
+                    x_train_aug=x_train_aug_for_fit,
+                    residual_target=residual_train_oof,
+                    groups_train=groups_train,
+                    sample_weight=residual_sample_weight,
+                    random_state=args.random_state,
+                    device=args.device,
+                    gpu_id=args.gpu_id,
+                    best_params=cat_best_params,
+                    early_stopping_rounds=args.catboost_early_stopping_rounds,
+                    validation_mode=args.validation_mode,
+                    regime_mode=args.catboost_expert_regime,
+                    trend_quantile=args.catboost_expert_trend_quantile,
+                    low_wind_quantile=args.catboost_expert_low_wind_quantile,
+                    special_weight=args.catboost_expert_special_weight,
+                    min_samples=args.catboost_expert_min_samples,
+                    general_model=cat_model,
+                    general_feature_cols=cat_feature_cols,
+                    general_categorical_cols=cat_categorical_cols,
+                )
         except CatBoostError as exc:
             if args.device == "gpu":
                 raise SystemExit(
@@ -945,6 +1019,40 @@ def evaluate_paths_for_region_prior_setting(
                     region_prior_label=region_prior_label,
                     county_ablation_label=county_setting_info["label"],
                     county_removed_cols=county_setting_info["removed_cols"],
+                )
+            )
+        elif path_name == "catboost_experts":
+            if cat_expert_bundle is None:
+                raise RuntimeError("catboost_experts 路径需要 CatBoost 专家模型结果。")
+            cat_expert_pred_bundle = predict_catboost_regime_expert_bundle(
+                expert_bundle=cat_expert_bundle,
+                x_aug=x_test_aug,
+            )
+            final_pred = trend_test_pred + cat_expert_pred_bundle["final_pred"]
+            expert_regime_config = dict(cat_expert_bundle["regime_config"])
+            expert_regime_config["special_test_count"] = int(
+                cat_expert_pred_bundle["special_count"]
+            )
+            path_results.append(
+                build_result_row(
+                    path_name=path_name,
+                    path_type="expert",
+                    xgb_view="none",
+                    objective="single",
+                    ensemble_config={
+                        "strategy": "single_model",
+                        "xgb_weight": 0.0,
+                        "catboost_weight": 1.0,
+                    },
+                    y_test=y_test,
+                    final_test_pred=final_pred,
+                    high_pm25_threshold=high_pm25_eval_config["threshold"],
+                    region_prior_enabled=bool(region_prior_setting["enabled"]),
+                    region_prior_smoothing=region_prior_setting["smoothing"],
+                    region_prior_label=region_prior_label,
+                    county_ablation_label=county_setting_info["label"],
+                    county_removed_cols=county_setting_info["removed_cols"],
+                    expert_config=expert_regime_config,
                 )
             )
         elif path_name.startswith("ensemble_"):
@@ -1201,6 +1309,16 @@ def main() -> None:
         "test_r2",
         "high_pm25_r2",
     ]
+    if "catboost_experts" in set(results_df["path_name"]):
+        expert_display_cols = [
+            "expert_regime_effective",
+            "expert_special_enabled",
+            "expert_special_train_count",
+            "expert_special_test_count",
+            "expert_special_weight",
+        ]
+        insert_at = display_cols.index("test_rmse")
+        display_cols[insert_at:insert_at] = expert_display_cols
     print(results_df[display_cols].to_string(index=False))
     print(f"\n对比结果已保存到：{out_path}")
     if not args.no_plot:

@@ -164,11 +164,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--residual-model",
-        choices=["xgboost", "catboost", "ensemble"],
+        choices=["xgboost", "catboost", "catboost_experts", "ensemble"],
         default="xgboost",
         help=(
             "残差模型类型：xgboost=仅用 XGBoost，"
-            "catboost=仅用 CatBoost，ensemble=双模型加权集成；默认：xgboost"
+            "catboost=仅用 CatBoost，"
+            "catboost_experts=分 regime 的双 CatBoost 专家模型，"
+            "ensemble=双模型加权集成；默认：xgboost"
         ),
     )
     parser.add_argument(
@@ -279,6 +281,41 @@ def parse_args() -> argparse.Namespace:
         help="CatBoost 残差模型早停轮数，默认：80",
     )
     parser.add_argument(
+        "--catboost-expert-regime",
+        choices=["trend_high", "low_wind", "trend_high_or_low_wind"],
+        default="trend_high_or_low_wind",
+        help=(
+            "CatBoost 专家模型的特殊 regime 定义："
+            "trend_high=趋势预测较高，"
+            "low_wind=风速较低，"
+            "trend_high_or_low_wind=两者满足其一；默认：trend_high_or_low_wind"
+        ),
+    )
+    parser.add_argument(
+        "--catboost-expert-trend-quantile",
+        type=float,
+        default=0.75,
+        help="特殊 regime 中“高趋势预测”的分位数阈值，默认：0.75",
+    )
+    parser.add_argument(
+        "--catboost-expert-low-wind-quantile",
+        type=float,
+        default=0.35,
+        help="特殊 regime 中“低风速”的分位数阈值，默认：0.35",
+    )
+    parser.add_argument(
+        "--catboost-expert-special-weight",
+        type=float,
+        default=0.75,
+        help="特殊 regime 内特殊专家预测的融合权重，范围 [0,1]，默认：0.75",
+    )
+    parser.add_argument(
+        "--catboost-expert-min-samples",
+        type=int,
+        default=120,
+        help="训练特殊专家所需的最少样本数，默认：120",
+    )
+    parser.add_argument(
         "--no-tune",
         action="store_true",
         help="关闭残差模型调参，仅使用默认参数训练",
@@ -342,6 +379,10 @@ def resolve_output_paths(
         "catboost": (
             f"cache/{run_name}/pm25_trend_residual_catboost.joblib",
             f".diag/{run_name}/pm25_trend_residual_catboost_diagnostics.png",
+        ),
+        "catboost_experts": (
+            f"cache/{run_name}/pm25_trend_residual_catboost_experts.joblib",
+            f".diag/{run_name}/pm25_trend_residual_catboost_experts_diagnostics.png",
         ),
         "ensemble": (
             f"cache/{run_name}/pm25_trend_residual_ensemble.joblib",
@@ -1246,6 +1287,86 @@ def default_catboost_residual_params(
     return params
 
 
+def build_catboost_expert_regime_config(
+    x_train_aug: pd.DataFrame,
+    regime_mode: str,
+    trend_quantile: float,
+    low_wind_quantile: float,
+    special_weight: float,
+    min_samples: int,
+) -> dict[str, Any]:
+    """构造 CatBoost 专家模型使用的 regime 配置。"""
+    if not 0.0 < trend_quantile < 1.0:
+        raise ValueError("catboost-expert-trend-quantile 必须在 (0, 1) 之间。")
+    if not 0.0 < low_wind_quantile < 1.0:
+        raise ValueError("catboost-expert-low-wind-quantile 必须在 (0, 1) 之间。")
+    if not 0.0 <= special_weight <= 1.0:
+        raise ValueError("catboost-expert-special-weight 必须在 [0, 1] 之间。")
+    if min_samples < 20:
+        raise ValueError("catboost-expert-min-samples 至少应为 20。")
+
+    trend_series = pd.to_numeric(
+        x_train_aug[TREND_FEATURE_NAME], errors="coerce"
+    ).astype(float)
+    trend_threshold = float(np.quantile(trend_series.to_numpy(), trend_quantile))
+
+    wind_threshold: float | None = None
+    wind_available = False
+    effective_regime_mode = regime_mode
+    if regime_mode in {"low_wind", "trend_high_or_low_wind"}:
+        if "wind" in x_train_aug.columns:
+            wind_series = pd.to_numeric(x_train_aug["wind"], errors="coerce").dropna()
+            if not wind_series.empty:
+                wind_available = True
+                wind_threshold = float(np.quantile(wind_series.to_numpy(), low_wind_quantile))
+
+    if regime_mode == "low_wind" and not wind_available:
+        raise ValueError(
+            "当前数据中不存在可用的 wind 列，无法使用 low_wind 专家 regime。"
+        )
+    if regime_mode == "trend_high_or_low_wind" and not wind_available:
+        effective_regime_mode = "trend_high"
+
+    return {
+        "requested_regime_mode": regime_mode,
+        "effective_regime_mode": effective_regime_mode,
+        "trend_quantile": float(trend_quantile),
+        "trend_threshold": trend_threshold,
+        "low_wind_quantile": float(low_wind_quantile),
+        "low_wind_threshold": wind_threshold,
+        "wind_available": wind_available,
+        "special_weight": float(special_weight),
+        "min_samples": int(min_samples),
+    }
+
+
+def compute_catboost_expert_special_mask(
+    x_aug: pd.DataFrame,
+    regime_config: dict[str, Any],
+) -> np.ndarray:
+    """根据规则计算哪些样本属于特殊 regime。"""
+    trend_series = pd.to_numeric(x_aug[TREND_FEATURE_NAME], errors="coerce").astype(float)
+    trend_mask = trend_series.to_numpy() >= regime_config["trend_threshold"]
+
+    effective_mode = regime_config["effective_regime_mode"]
+    if effective_mode == "trend_high":
+        return trend_mask.astype(bool)
+
+    wind_mask = np.zeros(len(x_aug), dtype=bool)
+    if regime_config.get("wind_available") and "wind" in x_aug.columns:
+        wind_series = pd.to_numeric(x_aug["wind"], errors="coerce")
+        wind_mask = (
+            wind_series.fillna(np.inf).to_numpy() <= regime_config["low_wind_threshold"]
+        )
+
+    if effective_mode == "low_wind":
+        return wind_mask.astype(bool)
+    if effective_mode == "trend_high_or_low_wind":
+        return np.logical_or(trend_mask, wind_mask)
+
+    raise ValueError(f"不支持的专家 regime 模式：{effective_mode}")
+
+
 def calculate_metrics(
     y_true: pd.Series | np.ndarray, y_pred: np.ndarray
 ) -> dict[str, float]:
@@ -1641,31 +1762,84 @@ def fit_final_catboost_residual_model(
     为了兼顾效率和泛化，这里会在训练集内部再切一小部分验证集用于 early stopping。
     如果分组模式可用，则优先使用按组切分，避免同城样本同时进入内部训练与验证。
     """
+    return fit_catboost_model_with_internal_validation(
+        x_train_aug=x_train_aug,
+        residual_target=residual_target,
+        groups_train=groups_train,
+        sample_weight=sample_weight,
+        random_state=random_state,
+        device=device,
+        gpu_id=gpu_id,
+        best_params=best_params,
+        early_stopping_rounds=early_stopping_rounds,
+        validation_mode=validation_mode,
+    )
+
+
+def fit_catboost_model_with_internal_validation(
+    x_train_aug: pd.DataFrame,
+    residual_target: pd.Series,
+    groups_train: pd.Series | None,
+    sample_weight: np.ndarray | None,
+    random_state: int,
+    device: str,
+    gpu_id: int,
+    best_params: dict[str, Any] | None,
+    early_stopping_rounds: int,
+    validation_mode: str,
+) -> tuple[CatBoostRegressor, list[str], list[str]]:
+    """训练单个 CatBoost 模型，并在可行时使用内部验证集做 early stopping。"""
     x_train_cb, categorical_cols = prepare_catboost_features(x_train_aug)
     feature_cols = x_train_cb.columns.tolist()
     final_params = default_catboost_residual_params(random_state, device, gpu_id)
     if best_params:
         final_params.update(best_params)
 
+    use_internal_validation = len(x_train_cb) >= 30
+    fit_idx: np.ndarray | None = None
+    val_idx: np.ndarray | None = None
+
+    if use_internal_validation:
+        try:
+            if (
+                validation_mode == "group"
+                and groups_train is not None
+                and groups_train.nunique() >= 2
+            ):
+                splitter = GroupShuffleSplit(
+                    n_splits=1,
+                    test_size=0.15,
+                    random_state=random_state,
+                )
+                fit_idx, val_idx = next(
+                    splitter.split(x_train_cb, residual_target, groups_train)
+                )
+            else:
+                fit_idx, val_idx = train_test_split(
+                    np.arange(len(x_train_cb)),
+                    test_size=0.15,
+                    random_state=random_state,
+                )
+        except ValueError:
+            use_internal_validation = False
+
     if (
-        validation_mode == "group"
-        and groups_train is not None
-        and groups_train.nunique() >= 2
+        not use_internal_validation
+        or fit_idx is None
+        or val_idx is None
+        or len(fit_idx) == 0
+        or len(val_idx) == 0
     ):
-        splitter = GroupShuffleSplit(
-            n_splits=1,
-            test_size=0.15,
-            random_state=random_state,
+        full_weight = sample_weight if sample_weight is not None else None
+        train_pool = Pool(
+            data=x_train_cb,
+            label=residual_target,
+            cat_features=categorical_cols,
+            weight=full_weight,
         )
-        fit_idx, val_idx = next(
-            splitter.split(x_train_cb, residual_target, groups_train)
-        )
-    else:
-        fit_idx, val_idx = train_test_split(
-            np.arange(len(x_train_cb)),
-            test_size=0.15,
-            random_state=random_state,
-        )
+        model = CatBoostRegressor(**final_params)
+        model.fit(train_pool, verbose=False)
+        return model, categorical_cols, feature_cols
 
     x_fit = x_train_cb.iloc[fit_idx]
     y_fit = residual_target.iloc[fit_idx]
@@ -1703,6 +1877,158 @@ def predict_catboost_residual_model(
     x_cb, _ = prepare_catboost_features(x_cb)
     pred_pool = Pool(data=x_cb, cat_features=categorical_cols)
     return np.asarray(model.predict(pred_pool), dtype=float)
+
+
+def fit_catboost_regime_expert_bundle(
+    x_train_aug: pd.DataFrame,
+    residual_target: pd.Series,
+    groups_train: pd.Series | None,
+    sample_weight: np.ndarray | None,
+    random_state: int,
+    device: str,
+    gpu_id: int,
+    best_params: dict[str, Any] | None,
+    early_stopping_rounds: int,
+    validation_mode: str,
+    regime_mode: str,
+    trend_quantile: float,
+    low_wind_quantile: float,
+    special_weight: float,
+    min_samples: int,
+    general_model: CatBoostRegressor | None = None,
+    general_feature_cols: list[str] | None = None,
+    general_categorical_cols: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    训练“普通专家 + 特殊专家”的 CatBoost 残差模型。
+
+    设计思路：
+    1. 普通专家覆盖全部样本，负责主流分布；
+    2. 特殊专家只在 high-trend / low-wind 等 regime 上训练；
+    3. 预测时，特殊 regime 内将两者做加权融合，提升极端场景拟合能力。
+    """
+    regime_config = build_catboost_expert_regime_config(
+        x_train_aug=x_train_aug,
+        regime_mode=regime_mode,
+        trend_quantile=trend_quantile,
+        low_wind_quantile=low_wind_quantile,
+        special_weight=special_weight,
+        min_samples=min_samples,
+    )
+    special_mask = compute_catboost_expert_special_mask(x_train_aug, regime_config)
+    special_count = int(special_mask.sum())
+    regime_config["special_train_count"] = special_count
+    regime_config["special_train_fraction"] = special_count / max(len(x_train_aug), 1)
+
+    if general_model is None or general_feature_cols is None or general_categorical_cols is None:
+        general_model, general_categorical_cols, general_feature_cols = (
+            fit_catboost_model_with_internal_validation(
+                x_train_aug=x_train_aug,
+                residual_target=residual_target,
+                groups_train=groups_train,
+                sample_weight=sample_weight,
+                random_state=random_state,
+                device=device,
+                gpu_id=gpu_id,
+                best_params=best_params,
+                early_stopping_rounds=early_stopping_rounds,
+                validation_mode=validation_mode,
+            )
+        )
+
+    if special_count < min_samples or special_count >= len(x_train_aug):
+        regime_config["special_expert_enabled"] = False
+        return {
+            "general_model": general_model,
+            "general_feature_cols": general_feature_cols,
+            "general_categorical_cols": general_categorical_cols,
+            "special_model": None,
+            "special_feature_cols": general_feature_cols,
+            "special_categorical_cols": general_categorical_cols,
+            "regime_config": regime_config,
+        }
+
+    special_x = x_train_aug.loc[special_mask].copy()
+    special_y = residual_target.loc[special_mask].copy()
+    special_groups = groups_train.loc[special_mask].copy() if groups_train is not None else None
+    special_weight_array = sample_weight[special_mask] if sample_weight is not None else None
+
+    special_model, special_categorical_cols, special_feature_cols = (
+        fit_catboost_model_with_internal_validation(
+            x_train_aug=special_x,
+            residual_target=special_y,
+            groups_train=special_groups,
+            sample_weight=special_weight_array,
+            random_state=random_state,
+            device=device,
+            gpu_id=gpu_id,
+            best_params=best_params,
+            early_stopping_rounds=early_stopping_rounds,
+            validation_mode=validation_mode,
+        )
+    )
+    regime_config["special_expert_enabled"] = True
+    return {
+        "general_model": general_model,
+        "general_feature_cols": general_feature_cols,
+        "general_categorical_cols": general_categorical_cols,
+        "special_model": special_model,
+        "special_feature_cols": special_feature_cols,
+        "special_categorical_cols": special_categorical_cols,
+        "regime_config": regime_config,
+    }
+
+
+def predict_catboost_regime_expert_bundle(
+    expert_bundle: dict[str, Any],
+    x_aug: pd.DataFrame,
+) -> dict[str, Any]:
+    """使用 CatBoost 专家模型做门控融合预测。"""
+    general_pred = predict_catboost_residual_model(
+        model=expert_bundle["general_model"],
+        x_aug=x_aug,
+        feature_cols=expert_bundle["general_feature_cols"],
+        categorical_cols=expert_bundle["general_categorical_cols"],
+    )
+    special_mask = compute_catboost_expert_special_mask(
+        x_aug=x_aug,
+        regime_config=expert_bundle["regime_config"],
+    )
+    special_count = int(special_mask.sum())
+    regime_config = expert_bundle["regime_config"]
+
+    special_model = expert_bundle.get("special_model")
+    if special_model is None or not regime_config.get("special_expert_enabled", False):
+        return {
+            "final_pred": general_pred,
+            "general_pred": general_pred,
+            "special_pred": None,
+            "special_mask": special_mask,
+            "special_count": special_count,
+            "special_weight": 0.0,
+        }
+
+    special_pred = predict_catboost_residual_model(
+        model=special_model,
+        x_aug=x_aug,
+        feature_cols=expert_bundle["special_feature_cols"],
+        categorical_cols=expert_bundle["special_categorical_cols"],
+    )
+    final_pred = general_pred.copy()
+    blend_weight = regime_config["special_weight"]
+    if special_count > 0:
+        final_pred[special_mask] = (
+            (1.0 - blend_weight) * general_pred[special_mask]
+            + blend_weight * special_pred[special_mask]
+        )
+    return {
+        "final_pred": final_pred,
+        "general_pred": general_pred,
+        "special_pred": special_pred,
+        "special_mask": special_mask,
+        "special_count": special_count,
+        "special_weight": blend_weight,
+    }
 
 
 def generate_oof_xgboost_residual_predictions(
@@ -2088,6 +2414,7 @@ def save_artifact(
     xgboost_residual_model: Pipeline | None,
     xgboost_feature_view_info: dict[str, Any],
     catboost_residual_model: CatBoostRegressor | None,
+    catboost_expert_bundle: dict[str, Any] | None,
     catboost_feature_cols: list[str],
     catboost_categorical_cols: list[str],
     ensemble_config: dict[str, Any],
@@ -2114,13 +2441,17 @@ def save_artifact(
             if residual_model_mode == "xgboost"
             else catboost_residual_model
             if residual_model_mode == "catboost"
+            else catboost_expert_bundle
+            if residual_model_mode == "catboost_experts"
             else None
         ),
         "residual_model_mode": residual_model_mode,
         "residual_models": {
             "xgboost": xgboost_residual_model,
             "catboost": catboost_residual_model,
+            "catboost_experts": catboost_expert_bundle,
         },
+        "catboost_expert_bundle": catboost_expert_bundle,
         "xgboost_feature_view_info": xgboost_feature_view_info,
         "catboost_feature_cols": catboost_feature_cols,
         "catboost_categorical_cols": catboost_categorical_cols,
@@ -2394,6 +2725,7 @@ def main() -> None:
     cat_best_cv_rmse: float | None = None
     xgb_residual_model: Pipeline | None = None
     catboost_residual_model: CatBoostRegressor | None = None
+    catboost_expert_bundle: dict[str, Any] | None = None
     xgb_residual_train_oof_pred: np.ndarray | None = None
     cat_residual_train_oof_pred: np.ndarray | None = None
     catboost_feature_cols: list[str] = []
@@ -2447,7 +2779,7 @@ def main() -> None:
                 ) from exc
             raise
 
-    if args.residual_model in ("catboost", "ensemble"):
+    if args.residual_model in ("catboost", "catboost_experts", "ensemble"):
         try:
             if args.no_tune:
                 print("[信息] 已关闭 CatBoost 残差调参，将使用默认参数训练。")
@@ -2486,6 +2818,28 @@ def main() -> None:
                 early_stopping_rounds=args.catboost_early_stopping_rounds,
                 validation_mode=args.validation_mode,
             )
+
+            if args.residual_model == "catboost_experts":
+                catboost_expert_bundle = fit_catboost_regime_expert_bundle(
+                    x_train_aug=x_train_aug_for_fit,
+                    residual_target=residual_train_oof,
+                    groups_train=groups_train,
+                    sample_weight=residual_sample_weight,
+                    random_state=args.random_state,
+                    device=args.device,
+                    gpu_id=args.gpu_id,
+                    best_params=cat_best_params,
+                    early_stopping_rounds=args.catboost_early_stopping_rounds,
+                    validation_mode=args.validation_mode,
+                    regime_mode=args.catboost_expert_regime,
+                    trend_quantile=args.catboost_expert_trend_quantile,
+                    low_wind_quantile=args.catboost_expert_low_wind_quantile,
+                    special_weight=args.catboost_expert_special_weight,
+                    min_samples=args.catboost_expert_min_samples,
+                    general_model=catboost_residual_model,
+                    general_feature_cols=catboost_feature_cols,
+                    general_categorical_cols=catboost_categorical_cols,
+                )
         except CatBoostError as exc:
             if args.device == "gpu":
                 raise SystemExit(
@@ -2566,10 +2920,15 @@ def main() -> None:
     trend_metrics = calculate_metrics(y_test, trend_test_pred)
     xgb_residual_test_pred: np.ndarray | None = None
     cat_residual_test_pred: np.ndarray | None = None
+    cat_expert_general_test_pred: np.ndarray | None = None
+    cat_expert_special_test_pred: np.ndarray | None = None
+    cat_expert_special_mask: np.ndarray | None = None
     xgb_final_test_pred: np.ndarray | None = None
     cat_final_test_pred: np.ndarray | None = None
+    cat_expert_final_test_pred: np.ndarray | None = None
     xgb_hybrid_metrics: dict[str, float] | None = None
     cat_hybrid_metrics: dict[str, float] | None = None
+    cat_expert_hybrid_metrics: dict[str, float] | None = None
 
     if xgb_residual_model is not None:
         xgb_residual_test_pred = xgb_residual_model.predict(xgb_test_aug)
@@ -2586,6 +2945,17 @@ def main() -> None:
         cat_final_test_pred = trend_test_pred + cat_residual_test_pred
         cat_hybrid_metrics = calculate_metrics(y_test, cat_final_test_pred)
 
+    if catboost_expert_bundle is not None:
+        cat_expert_pred_bundle = predict_catboost_regime_expert_bundle(
+            expert_bundle=catboost_expert_bundle,
+            x_aug=x_test_aug,
+        )
+        cat_expert_general_test_pred = cat_expert_pred_bundle["general_pred"]
+        cat_expert_special_test_pred = cat_expert_pred_bundle["special_pred"]
+        cat_expert_special_mask = cat_expert_pred_bundle["special_mask"]
+        cat_expert_final_test_pred = trend_test_pred + cat_expert_pred_bundle["final_pred"]
+        cat_expert_hybrid_metrics = calculate_metrics(y_test, cat_expert_final_test_pred)
+
     if args.residual_model == "xgboost":
         residual_test_pred = xgb_residual_test_pred
         final_test_pred = xgb_final_test_pred
@@ -2596,6 +2966,13 @@ def main() -> None:
         final_test_pred = cat_final_test_pred
         hybrid_metrics = cat_hybrid_metrics
         final_model_name = "Trend + CatBoost Residual"
+    elif args.residual_model == "catboost_experts":
+        if catboost_expert_bundle is None:
+            raise RuntimeError("catboost_experts 模式需要先成功训练专家模型。")
+        residual_test_pred = cat_expert_final_test_pred - trend_test_pred
+        final_test_pred = cat_expert_final_test_pred
+        hybrid_metrics = cat_expert_hybrid_metrics
+        final_model_name = "Trend + CatBoost Regime Experts"
     else:
         if xgb_residual_test_pred is None or cat_residual_test_pred is None:
             raise RuntimeError("双模型集成需要同时得到 XGBoost 与 CatBoost 残差预测。")
@@ -2628,6 +3005,7 @@ def main() -> None:
     result_title = {
         "xgboost": "PM2.5 线性趋势 + XGBoost 残差结果",
         "catboost": "PM2.5 线性趋势 + CatBoost 残差结果",
+        "catboost_experts": "PM2.5 线性趋势 + CatBoost 专家残差结果",
         "ensemble": "PM2.5 线性趋势 + 双残差模型集成结果",
     }[args.residual_model]
 
@@ -2645,6 +3023,34 @@ def main() -> None:
         print(f"XGBoost 残差 CV 最优 RMSE   : {xgb_best_cv_rmse:.4f}")
     if cat_best_cv_rmse is not None:
         print(f"CatBoost 残差 CV 最优 RMSE  : {cat_best_cv_rmse:.4f}")
+    if args.residual_model == "catboost_experts" and catboost_expert_bundle is not None:
+        regime_config = catboost_expert_bundle["regime_config"]
+        print(
+            "专家 regime 配置            : "
+            f"requested={regime_config['requested_regime_mode']}, "
+            f"effective={regime_config['effective_regime_mode']}"
+        )
+        print(
+            "专家 regime 阈值            : "
+            f"trend_q={regime_config['trend_quantile']:.2f}"
+            f" -> {regime_config['trend_threshold']:.4f}, "
+            f"low_wind_q={regime_config['low_wind_quantile']:.2f}"
+            f" -> {regime_config['low_wind_threshold'] if regime_config['low_wind_threshold'] is not None else 'N/A'}"
+        )
+        print(
+            "特殊专家训练样本            : "
+            f"{regime_config['special_train_count']} "
+            f"({regime_config['special_train_fraction']:.2%})"
+        )
+        print(
+            "特殊专家融合权重            : "
+            f"{regime_config['special_weight']:.2f}"
+        )
+        if cat_expert_special_mask is not None:
+            print(
+                "特殊 regime 测试样本数      : "
+                f"{int(cat_expert_special_mask.sum())}"
+            )
     if args.residual_model == "ensemble":
         print(
             "集成权重策略                : "
@@ -2681,6 +3087,10 @@ def main() -> None:
         print(f"CatBoost 融合 测试集 RMSE   : {cat_hybrid_metrics['RMSE']:.4f}")
         print(f"CatBoost 融合 测试集 MAE    : {cat_hybrid_metrics['MAE']:.4f}")
         print(f"CatBoost 融合 测试集 R^2    : {cat_hybrid_metrics['R2']:.4f}")
+    if cat_expert_hybrid_metrics is not None and args.residual_model == "catboost_experts":
+        print(f"专家融合 测试集 RMSE        : {cat_expert_hybrid_metrics['RMSE']:.4f}")
+        print(f"专家融合 测试集 MAE         : {cat_expert_hybrid_metrics['MAE']:.4f}")
+        print(f"专家融合 测试集 R^2         : {cat_expert_hybrid_metrics['R2']:.4f}")
     print(f"融合模型 测试集 RMSE        : {hybrid_metrics['RMSE']:.4f}")
     print(f"融合模型 测试集 MAE         : {hybrid_metrics['MAE']:.4f}")
     print(f"融合模型 测试集 R^2         : {hybrid_metrics['R2']:.4f}")
@@ -2692,7 +3102,7 @@ def main() -> None:
             "XGBoost 最优参数            : "
             f"{xgb_best_params if xgb_best_params else '默认参数（未调参）'}"
         )
-    if args.residual_model in ("catboost", "ensemble"):
+    if args.residual_model in ("catboost", "catboost_experts", "ensemble"):
         print(
             "CatBoost 最优参数           : "
             f"{cat_best_params if cat_best_params else '默认参数（未调参）'}"
@@ -2719,6 +3129,23 @@ def main() -> None:
         sample_dict["xgb_residual_pred"] = xgb_residual_test_pred[:10]
         sample_dict["cat_residual_pred"] = cat_residual_test_pred[:10]
         sample_dict["ensemble_residual_pred"] = residual_test_pred[:10]
+    elif args.residual_model == "catboost_experts":
+        sample_dict["general_residual_pred"] = (
+            cat_expert_general_test_pred[:10]
+            if cat_expert_general_test_pred is not None
+            else np.full(10, np.nan)
+        )
+        sample_dict["special_residual_pred"] = (
+            cat_expert_special_test_pred[:10]
+            if cat_expert_special_test_pred is not None
+            else np.full(10, np.nan)
+        )
+        sample_dict["expert_regime_flag"] = (
+            cat_expert_special_mask[:10].astype(int)
+            if cat_expert_special_mask is not None
+            else np.zeros(10, dtype=int)
+        )
+        sample_dict["residual_pred"] = residual_test_pred[:10]
     else:
         sample_dict["residual_pred"] = residual_test_pred[:10]
     sample_dict["final_pred"] = final_test_pred[:10]
@@ -2740,6 +3167,11 @@ def main() -> None:
         print_top_residual_importances(xgb_residual_model, top_n=20)
     if catboost_residual_model is not None:
         print_top_catboost_residual_importances(catboost_residual_model, top_n=20)
+    if args.residual_model == "catboost_experts" and catboost_expert_bundle is not None:
+        special_model = catboost_expert_bundle.get("special_model")
+        if special_model is not None:
+            print("\nCatBoost 特殊专家 Top 20 特征重要性：")
+            print_top_catboost_residual_importances(special_model, top_n=20)
 
     # 9) 按需保存模型
     if not args.no_save:
@@ -2749,6 +3181,7 @@ def main() -> None:
             xgboost_residual_model=xgb_residual_model,
             xgboost_feature_view_info=xgb_feature_view_info,
             catboost_residual_model=catboost_residual_model,
+            catboost_expert_bundle=catboost_expert_bundle,
             catboost_feature_cols=catboost_feature_cols,
             catboost_categorical_cols=catboost_categorical_cols,
             ensemble_config=ensemble_config,
